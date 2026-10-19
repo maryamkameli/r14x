@@ -1,0 +1,11 @@
+# Overnight queue on GPUs 0-3 (scripts/run_queue.sh). Line 1 = the priority run: Qwen3-1.7B variant IV.
+# IV = p<1% + truncated per-token IS (Qwen3-4B mu-traces) + cosine anneal of the teacher rows to 0 at 20% of the steps, then GRPO-4.
+r1x4 --model qwen3-1.7b --data core --p 1 --ches no --ranking no --is yes --anneal yes --steps 300
+# the recipe's own arm (A2): append layout, 4 students + 2 positive mu-rows, student baseline, no negatives, length norm, no entropy
+r1x4 --model qwen3-1.7b --data core --p 1 --ches no --ranking no --is yes --anneal yes --layout append --k_teacher 2 --baseline student --neg_weight 0 --len_ref 2048 --entropy 0 --entropy_student_only yes --steps 300
+r1x4 --model qwen3-1.7b --data core --p 1 --ches no --ranking no --is no --anneal yes --layout append --k_teacher 2 --baseline student --neg_weight 0 --len_ref 2048 --entropy 0 --entropy_student_only yes --steps 300
+# its controls: same anneal without IS (R1 traces, p/(p+0.1) shaping), and variants III / II / I
+r1x4 --model qwen3-1.7b --data core --p 1 --ches no --ranking no --is no --anneal yes --steps 300
+r1x4 --model qwen3-1.7b --data core --p 1 --ches no --ranking no --steps 300
+r1x4 --model qwen3-1.7b --data core --p 1 --ches no --ranking yes --steps 300
+r1x4 --model qwen3-1.7b --data core --p 1 --ches yes --ranking yes --steps 300

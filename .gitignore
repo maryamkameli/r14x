@@ -1,0 +1,10 @@
+*.parquet
+*.pt
+*.safetensors
+__pycache__/
+*.egg-info/
+outputs/
+wandb/
+*.log
+data/mu/
+data/ampo/

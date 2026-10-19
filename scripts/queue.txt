@@ -1,0 +1,18 @@
+# One run per line, executed in order on GPUs 0-3 (scripts/run_queue.sh). Edit freely; finished lines go to queue.txt.done.
+# Variants: I = --p 1 --ches yes --ranking yes ; II = --p 1 --ches no --ranking yes ; III = --p 1 --ches no --ranking no
+# Qwen3-1.7B first (48 prompts/step), then Qwen3-4B (40 prompts/step).
+r1x4 --model qwen3-1.7b --data core --p 1 --ches yes --ranking yes --steps 300
+r1x4 --model qwen3-1.7b --data core --p 1 --ches no --ranking yes --steps 300
+r1x4 --model qwen3-1.7b --data core --p 1 --ches no --ranking no --steps 300
+r1x4 --model qwen3-4b --data core --p 1 --ches yes --ranking yes --steps 200
+r1x4 --model qwen3-4b --data core --p 1 --ches no --ranking yes --steps 200
+r1x4 --model qwen3-4b --data core --p 1 --ches no --ranking no --steps 200
+# other datasets (same three variants): --data luffy21k | extended | r1qwen | qwen3
+# r1x4 --model qwen3-1.7b --data extended --p 1 --ches yes --ranking yes --steps 300
+# r1x4 --model qwen3-1.7b --data r1qwen --p 1 --ches yes --ranking yes --steps 300
+# r1x4 --model qwen3-1.7b --data qwen3 --p 1 --ches yes --ranking yes --steps 300
+# r1x4 --model qwen3-1.7b --data luffy21k --p 1 --ches yes --ranking yes --steps 300
+# r1x4 --model qwen2.5-math-7b --data core --p 1 --ches yes --ranking yes --steps 200
+# modified AMPO (per-update likelihood selection over all teacher traces) and its original-AMPO control:
+# ampo --model qwen3-4b --selection loglik
+# ampo --model qwen3-4b --selection static

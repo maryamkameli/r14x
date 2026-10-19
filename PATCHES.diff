@@ -1,0 +1,1150 @@
+diff -ruN -x __pycache__ -x outputs verl_orig_ampo_ro/verl/adaptive_mix_src/config/mix_dapo_trainer.yaml verl/verl/adaptive_mix_src/config/mix_dapo_trainer.yaml
+--- verl_orig_ampo_ro/verl/adaptive_mix_src/config/mix_dapo_trainer.yaml	2026-10-18 18:46:22.220345705 -0500
++++ verl/verl/adaptive_mix_src/config/mix_dapo_trainer.yaml	2026-10-19 10:01:09.336401211 -0500
+@@ -57,6 +57,12 @@
+     on_policy_reshape_pow_exp: 0.5
+     sft_prefix_reward_weight: 1.0
+     all_max_clip: -1
++    teacher_token_min_prob: 0.0       # r1x4: drop teacher tokens with pre-update p < this (0 = off)
++    teacher_token_min_prob_rows: all  # all | pos | neg teacher rows
++    loss_row_mean_fix: False          # True: per-row weight 1/(L*mini) also under dynamic bsz (AMPO default: off)
++    is_cbar: 1.0                      # r1x4 variant IV: per-token IS ratio truncation c-bar
++    is_logratio_min: -20.0            # r1x4 variant IV: lower clamp on log(pi/mu)
++    entropy_student_only: False       # entropy bonus on student tokens only
+     use_ppo_kl_loss: False
+     ppo_kl_loss_coef: 0.01
+     use_adaptive_temperature: False
+@@ -170,3 +176,42 @@
+   project_name: verl-mix-dapo
+   skip_valid_mask: False
+   val_only: False
++
++r1x4:  # used only by verl.r1x4.main_r1x4
++  seed: 47
++  teacher_eos_token: null         # token appended to stored traces (null = tokenizer.eos_token)
++  student_eos_ids: null           # ids counted as termination in the student metric (null = [eos_token_id])
++  retire_after_all_correct: 2     # retire a prompt after this many consecutive all-correct visits (0 = never)
++  rank:
++    enable: False
++    pool: 1000                    # next prompts in LUFFY visit order that are teacher-forced
++    top: 100                      # most likely ones trained, in decreasing likelihood
++    max_neg: 4                    # wrong traces per prompt scored
++    score: sum                    # sum | min | pos | neg of the mean token log-likelihoods of pos and best neg
++    chunk: 512                    # rows per compute_log_prob call
++  ches:
++    enable: False
++    drop_frac: 0.5                # fraction of each negative row's response tokens dropped (highest score)
++    score: cos                    # cos | ip
++    rows: all                     # all | teacher | student negative rows
++  layout: r1x4                    # r1x4 = 4 students + 4 teachers filled to exactly 4C/4W | append = 4 students + k_teacher positive rows
++  k_teacher: 2                    # teacher rows per prompt in the append layout (uniform over the prompt's correct traces)
++  baseline: group                 # group = mean of all rows (R1x4: pinned 0.5) | student = mean of the 4 student rows (Dr.GRPO)
++  anneal:                         # variant IV: teacher rows x lambda_t, cosine to 0 at T_a, then pure GRPO-4
++    enable: False
++    frac: 0.2                     # T_a = round(frac * total_training_steps)
++    lambda0: 1.0                  # 1 = R1x4's teacher weight at step 1; calibrate with diag/grad_ratio
++    lambda_min: 0.0               # must be 0 for the natural fixed point
++    schedule: cosine              # cosine | linear | constant
++    hold_steps: 0                 # H: steps held at lambda0 before the decay
++    neg_weight: 1.0               # multiplier for wrong teacher rows (0 drops them; R1x4 = 1)
++    gate: always                  # always | all_fail (all_fail drops every wrong teacher, so R1x4 keeps 'always')
++    len_ref: 0                    # >0: teacher rows x len_ref/|row| (recipe); 0 = R1x4's constant normalizer
++    reset_adam: True              # clear AdamW m, v, step once at t = T_a + 1
++    diag_every: 10                # gradient diagnostic g_S vs g_T every k steps while lambda > 0 (0 = off)
++  isamp:                          # variant IV: truncated per-token IS on self-sampled correct teacher traces
++    enable: False
++    cbar: 1.0
++    logratio_min: -20.0
++    mu_pool: null                 # parquet(s) from scripts/gen_teacher_mu.py (comma list / globs)
++
+diff -ruN -x __pycache__ -x outputs verl_orig_ampo_ro/verl/adaptive_mix_src/mix_actor.py verl/verl/adaptive_mix_src/mix_actor.py
+--- verl_orig_ampo_ro/verl/adaptive_mix_src/mix_actor.py	2026-10-18 18:46:22.246996513 -0500
++++ verl/verl/adaptive_mix_src/mix_actor.py	2026-10-19 10:01:09.308784191 -0500
+@@ -115,6 +115,15 @@
+         #     select_keys.append('on_logprobs_std')
+         if self.config.use_off_policy_loss and self.config.use_off_policy_probs:
+             select_keys.append('target_probs')
++        if 'ches_keep' in data.batch.keys():  # r1x4 per-token CHES keep mask
++            select_keys.append('ches_keep')
++        for k in ('teacher_logp', 'teacher_mu_mask'):  # r1x4 variant IV: per-token IS on self-sampled teacher traces
++            if k in data.batch.keys():
++                select_keys.append(k)
++        if data.meta_info.get('reset_optim'):  # variant IV switch-off: fresh AdamW m, v, step from the next step()
++            self.actor_optimizer.state.clear()
++            print('[r1x4] AdamW state cleared at the end of the teacher phase', flush=True)
++        teacher_diag = data.meta_info.get('teacher_diag', False)
+             
+         has_multi_modal_inputs = "multi_modal_inputs" in data.non_tensor_batch.keys()
+         non_tensor_select_keys = ["multi_modal_inputs"] if has_multi_modal_inputs else []
+@@ -139,12 +148,13 @@
+                     )
+                     micro_batches = mini_batch.split(self.config.ppo_micro_batch_size_per_gpu)
+ 
++                if teacher_diag and batch_idx == 0:
++                    append_to_dict(metrics, self._grad_diag(micro_batches, temperature))
+                 self.actor_optimizer.zero_grad()
+                 if self.alpha_optimizer is not None:
+                     self.alpha_optimizer.zero_grad()
+ 
+                 for micro_batch in micro_batches:
+-                    print("MICROBATCH STEP")
+                     micro_batch = micro_batch.to(get_device_id())  # actor device is cpu when using offload
+                     micro_batch_metrics = {}
+                     model_inputs = {**micro_batch.batch, **micro_batch.non_tensor_batch}
+@@ -223,6 +233,9 @@
+                             target_probs=model_inputs['target_probs'] if 'target_probs' in data else None,
+                             loss_agg_mode=loss_agg_mode,
+                             config=self.config,
++                            **({'token_keep': model_inputs['ches_keep']} if 'ches_keep' in model_inputs else {}),
++                            **({'teacher_logp': model_inputs['teacher_logp'], 'teacher_mu_mask': model_inputs['teacher_mu_mask']}
++                               if 'teacher_mu_mask' in model_inputs else {}),
+                         )
+                         pg_loss = ret_dict['pg_loss']
+                         off_pg_loss = ret_dict['off_pg_loss']
+@@ -252,6 +265,9 @@
+                                 
+                         if 'on_policy_prob' in ret_dict:
+                             data['actor/on_policy_prob'] = ret_dict['on_policy_prob'].detach().item()
++                        for key in ('teacher_lowp_drop_frac', 'ches_drop_frac'):
++                            if key in ret_dict:
++                                data[f'actor/{key}'] = ret_dict[key].detach().item()
+                         if 'off_ratio_mean' in ret_dict:
+                             data['actor/off_ratio_mean'] = ret_dict['off_ratio_mean'].detach().item()
+                         if 'off_ratio_max_clip_frac' in ret_dict:
+@@ -278,7 +294,8 @@
+                         
+                     # compute entropy loss from entropy
+                     if entropy_coeff != 0:
+-                        entropy_loss = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
++                        ent_mask = response_mask * (~model_inputs['prefix_mask']) if self.config.get('entropy_student_only', False) else response_mask
++                        entropy_loss = agg_loss(loss_mat=entropy, loss_mask=ent_mask, loss_agg_mode=loss_agg_mode)
+ 
+                         # compute policy loss
+                         policy_loss = pg_loss - entropy_loss * entropy_coeff
+@@ -348,6 +365,38 @@
+             self.alpha_optimizer.zero_grad()
+         return metrics
+     
++    def _grad_diag(self, micro_batches, temperature):
++        """r1x4 variant IV: pg-loss gradient of the student rows (g_S) vs the teacher rows (g_T), entropy excluded.
++        Both use the real loss with the other rows' advantages zeroed (the loss is linear in A). Logs ||g_T||/||g_S||, cos."""
++        from .mix_core_alg import compute_token_on_off_policy_loss as loss_fn
++        params = [p for p in self.actor_module.parameters() if p.requires_grad]
++        saved = {}
++        for part in ('S', 'T'):
++            self.actor_optimizer.zero_grad()
++            for mb in micro_batches:
++                mb = mb.to(get_device_id())
++                mi = {**mb.batch}
++                row_t = mi['prefix_mask'].any(-1, keepdim=True)
++                adv = mi['advantages'] * (row_t if part == 'T' else ~row_t)
++                _, lp = self._forward_micro_batch(mi, temperature=temperature, calculate_entropy=False)
++                ret = loss_fn(old_log_prob=mi['old_log_probs'], log_prob=lp, advantages=adv, eos_mask=mi['response_mask'],
++                              prefix_mask=mi['prefix_mask'], config=self.config, token_keep=mi.get('ches_keep'),
++                              teacher_logp=mi.get('teacher_logp'), teacher_mu_mask=mi.get('teacher_mu_mask'))
++                scale = mi['response_mask'].shape[0] / self.config.ppo_mini_batch_size if self.config.use_dynamic_bsz else 1 / self.gradient_accumulation
++                (ret['pg_loss'] * scale).backward()
++            saved[part] = [p.grad.detach().float().clone() if p.grad is not None else None for p in params]
++        self.actor_optimizer.zero_grad()
++        sums = torch.zeros(3, device=get_device_id())
++        for gs, gt in zip(saved['S'], saved['T']):
++            if gs is not None and gt is not None:
++                sums += torch.stack([(gs * gs).sum(), (gt * gt).sum(), (gs * gt).sum()])
++        if torch.distributed.is_initialized():
++            torch.distributed.all_reduce(sums)
++        ss, tt, st = sums.tolist()
++        if not all(np.isfinite([ss, tt, st])) or ss <= 0 or tt <= 0:
++            return {}
++        return {'diag/grad_ratio': (tt / ss) ** 0.5, 'diag/cos': st / (ss * tt) ** 0.5}
++
+     def _optimizer_step(self):
+         assert self.config.grad_clip is not None
+ 
+diff -ruN -x __pycache__ -x outputs verl_orig_ampo_ro/verl/adaptive_mix_src/mix_core_alg.py verl/verl/adaptive_mix_src/mix_core_alg.py
+--- verl_orig_ampo_ro/verl/adaptive_mix_src/mix_core_alg.py	2026-10-18 18:46:22.190533674 -0500
++++ verl/verl/adaptive_mix_src/mix_core_alg.py	2026-10-19 10:01:09.311631656 -0500
+@@ -81,6 +81,9 @@
+     target_probs=None,
+     loss_agg_mode: str = "token-mean",
+     config: Optional[DictConfig | AlgoConfig] = None,
++    token_keep=None,
++    teacher_logp=None,
++    teacher_mu_mask=None,
+ ):
+     """
+     Args:
+@@ -96,6 +99,8 @@
+             The clip range used in PPO.
+         prefix_mask: `(torch.Tensor)`
+             shape: (bs, response_length)
++        token_keep: `(torch.Tensor)` or None (r1x4: per-token CHES keep mask, 1 = keep)
++            shape: (bs, response_length)
+ 
+     Returns:
+         pg_loss: `a scalar torch.Tensor`
+@@ -254,6 +259,13 @@
+         off_ratio_mean = torch.tensor(0.0)
+ 
+     off_pg_losses = -advantages * off_ratio
++    if teacher_mu_mask is not None and teacher_mu_mask.any():
++        # r1x4 variant IV, truncated per-token IS on self-sampled teacher tokens: -A * sg(min(cbar, pi/mu)) * log pi,
++        # in fp32 log space (clamping the DETACHED ratio keeps a nonzero gradient on truncated tokens; not PPO-clip)
++        import math
++        logr = (log_prob.float() - teacher_logp.float()).clamp(min=config.get("is_logratio_min", -20.0), max=math.log(config.get("is_cbar", 1.0)))
++        is_losses = -advantages * logr.exp().detach() * log_prob.float()
++        off_pg_losses = torch.where(teacher_mu_mask.bool(), is_losses.to(off_pg_losses.dtype), off_pg_losses)
+     
+     off_pg_loss = verl_F.masked_mean(off_pg_losses, prefix_mask * eos_mask)
+     if off_pg_loss.isnan().item() is True:
+@@ -279,9 +291,30 @@
+         eos_mask = eos_mask * p_on_mask
+         pg_losses = pg_losses * p_on_mask
+         
++    # r1x4: drop (not renormalize) tokens. Under loss_remove_token_mean the normalizer is the constant
++    # response length, so dropped tokens leave and the rest keep their weight.
++    teacher_lowp_drop_frac = ches_drop_frac = None
++    min_p = config.get("teacher_token_min_prob", 0.0) or 0.0
++    if min_p > 0:  # teacher tokens the PRE-UPDATE policy finds unlikely (p_old < min_p) lose their gradient
++        tok_t = prefix_mask.bool() & eos_mask.bool()
++        rows = config.get("teacher_token_min_prob_rows", "all")
++        if rows != "all":
++            row_adv = (advantages * eos_mask).sum(-1, keepdim=True)
++            tok_t = tok_t & (row_adv.gt(0) if rows == "pos" else row_adv.lt(0))
++        low = tok_t & (torch.exp(old_log_prob) < min_p)
++        pg_losses = pg_losses * (~low).to(pg_losses.dtype)
++        teacher_lowp_drop_frac = low.sum().float() / torch.clamp(tok_t.sum().float(), min=1.0)
++    if token_keep is not None:  # per-token CHES: dropped tokens of negative rows lose their gradient
++        drop = eos_mask.bool() & ~token_keep.bool()
++        pg_losses = pg_losses * (~drop).to(pg_losses.dtype)
++        ches_drop_frac = drop.sum().float() / torch.clamp((eos_mask.bool() & (advantages < 0)).sum().float(), min=1.0)
++
+     if loss_remove_token_mean is True:
+         pg_loss = (pg_losses * eos_mask).sum() / eos_mask.shape[-1]
+-        print(f'no token mean: mean normalization {eos_mask.shape[-1]}, using loss_agg_mode: seq-mean-token-sum-norm')
++        if config.get("loss_row_mean_fix", False):
++            # the actor multiplies by rows_in_micro / mini_batch (dynamic bsz) or micro / mini (fixed): a mean over the
++            # micro-batch rows makes every row weigh 1 / (L * mini_batch) in both modes (== the original at micro=1)
++            pg_loss = pg_loss / eos_mask.shape[0]
+     else:
+         # pg_loss = verl_F.masked_mean(pg_losses, eos_mask)
+         pg_loss = agg_loss(loss_mat=pg_losses, loss_mask=eos_mask, loss_agg_mode=loss_agg_mode)
+@@ -300,6 +333,8 @@
+         "off_ratio_mean": off_ratio_mean,
+         "off_ratio_max_clip_frac": off_ratio_max_clip_frac,
+         "off_ratio_min_clip_frac": off_ratio_min_clip_frac,
++        **({"teacher_lowp_drop_frac": teacher_lowp_drop_frac} if teacher_lowp_drop_frac is not None else {}),
++        **({"ches_drop_frac": ches_drop_frac} if ches_drop_frac is not None else {}),
+     }
+ @register_policy_loss("mixed_seq_off_policy_loss")
+ def compute_token_on_seq_off_policy_loss(
+diff -ruN -x __pycache__ -x outputs verl_orig_ampo_ro/verl/adaptive_mix_src/mix_dapo_trainer.py verl/verl/adaptive_mix_src/mix_dapo_trainer.py
+--- verl_orig_ampo_ro/verl/adaptive_mix_src/mix_dapo_trainer.py	2026-10-18 18:46:22.197771776 -0500
++++ verl/verl/adaptive_mix_src/mix_dapo_trainer.py	2026-10-18 18:58:56.134076341 -0500
+@@ -487,7 +487,7 @@
+ 
+         n = len(inputs)
+         base_data = {
+-            "source": sources,
++            "source": sources if sources is not None else [None] * n,
+             "input": inputs,
+             "output": outputs,
+             "gts": gts,
+@@ -624,6 +624,7 @@
+         val_data_dir = self.config.trainer.get("validation_data_dir", None)
+         if val_data_dir:
+             self._dump_generations(
++                sources=None,
+                 inputs=sample_inputs,
+                 outputs=sample_outputs,
+                 gts=sample_gts,
+@@ -923,6 +924,9 @@
+                                 metrics['injection/prob_reward_min'] = injection_stats['prob_reward_min']
+                             if 'prob_reward_std' in injection_stats:
+                                 metrics['injection/prob_reward_std'] = injection_stats['prob_reward_std']
++                            for key in ('loglik_all_mean', 'loglik_chosen_mean'):
++                                if key in injection_stats:
++                                    metrics[f'injection/{key}'] = injection_stats[key]
+                             if 'num_incorrect_teacher_responses' in injection_stats:
+                                 metrics['injection/num_incorrect_teacher_responses'] = injection_stats['num_incorrect_teacher_responses']
+                             if 'num_correct_teacher_responses' in injection_stats:
+@@ -1355,6 +1359,12 @@
+         orignal_batch_size = batch_size // n
+         
+         scoreA_list, scoreB_list, scoreB_minus_scoreA_list = [], [], []
++        # fork: 'loglik' ranks EVERY teacher trace of every prompt by its teacher-forced mean token log-likelihood under
++        # the CURRENT policy, recomputed right before this update (one batched forward), instead of a static order
++        loglik = None
++        if self.config.reward_model.get('off_policy_reward_manager', None) == 'loglik':
++            loglik = self._target_loglik(gen_batch, off_policy_targets, target_source_list, n, orignal_batch_size)
++        loglik_chosen, loglik_all = [], []
+         for i in range(orignal_batch_size):
+             start_idx = i * n
+             end_idx = (i + 1) * n
+@@ -1545,6 +1555,16 @@
+                     sample_target_sources = [sample_target_sources[idx.item()] for idx in sort_indices]
+                 else:
+                     logger.info(f"off_policy responses num <= 1, no sorting needed")
++            elif loglik is not None:
++                if num_teacher_models > 1:
++                    sc = torch.zeros_like(sample_off_policy_batch.batch['responses'], dtype=torch.float32)
++                    sc[:, 0] = torch.tensor([loglik[i][t] for t in range(num_teacher_models)])
++                    sample_off_policy_batch.batch['loglik_scores'] = sc
++                    sample_off_policy_batch, sort_indices = self._sort_batch_by_scores(sample_off_policy_batch, score_key='loglik_scores')
++                    sample_off_policy_batch.batch.pop('loglik_scores')
++                    sample_target_sources = [sample_target_sources[idx.item()] for idx in sort_indices]
++                    loglik_all += [loglik[i][t] for t in range(num_teacher_models)]
++                    loglik_chosen += [loglik[i][idx.item()] for idx in sort_indices[:effective_k]]
+             elif self.config.reward_model.off_policy_reward_manager == 'random':
+                 if num_teacher_models > 1:
+                     sample_off_policy_batch, sort_indices = self._sort_batch_by_scores(sample_off_policy_batch, score_key='random')
+@@ -1667,6 +1687,8 @@
+             'num_correct_teacher_responses': self.correct_teacher_responses,
+             'num_incorrect_teacher_responses': self.in_correct_teacher_responses,
+         }
++        if loglik_all:
++            injection_stats.update({'loglik_all_mean': float(np.mean(loglik_all)), 'loglik_chosen_mean': float(np.mean(loglik_chosen))})
+         if len(scoreB_minus_scoreA_list) > 0:
+             injection_stats.update({
+                 'prob_reward_mean': sum(scoreB_minus_scoreA_list) / len(scoreB_minus_scoreA_list),
+@@ -1686,6 +1708,26 @@
+                     
+         return DataProto(batch=mixed_batch, meta_info=meta_info)
+     
++    def _target_loglik(self, gen_batch, off_policy_targets, target_source_list, n, num_prompts):
++        """{prompt: {target: mean token log p_theta(target | prompt)}} for all teacher traces, current policy."""
++        from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
++        base = gen_batch.select(batch_keys=['input_ids', 'attention_mask', 'position_ids'], non_tensor_batch_keys=['raw_prompt_ids'])
++        prompts, resp, owner = [], [], []
++        for i in range(num_prompts):
++            s, k = i * n, len(target_source_list[i * n])
++            prompts.append(base.slice(s, s + 1).repeat(repeat_times=k, interleave=True))
++            resp.append(off_policy_targets[s][:k].clone())
++            owner += [(i, t) for t in range(k)]
++        batch = self.construct_off_policy_gen_batch(response=torch.cat(resp), prompts=DataProto.concat(prompts), batch_size=len(owner))
++        padded, pad = pad_dataproto_to_divisor(batch, self.actor_rollout_wg.world_size)
++        lp = unpad_dataproto(self.actor_rollout_wg.compute_log_prob(padded), pad).batch['old_log_probs']
++        mask = batch.batch['attention_mask'][:, -lp.shape[-1]:].float()
++        mean = ((lp * mask).sum(-1) / mask.sum(-1).clamp(min=1)).tolist()
++        out = defaultdict(dict)
++        for (i, t), v in zip(owner, mean):
++            out[i][t] = v
++        return out
++
+     def construct_off_policy_gen_batch(self, response, prompts: DataProto, batch_size: int):
+         
+         batch_size = batch_size
+diff -ruN -x __pycache__ -x outputs verl_orig_ampo_ro/verl/adaptive_mix_src/mix_fsdp_worker.py verl/verl/adaptive_mix_src/mix_fsdp_worker.py
+--- verl_orig_ampo_ro/verl/adaptive_mix_src/mix_fsdp_worker.py	2026-10-18 18:46:22.183213533 -0500
++++ verl/verl/adaptive_mix_src/mix_fsdp_worker.py	2026-10-18 19:35:02.149971506 -0500
+@@ -243,7 +243,8 @@
+ 
+         # override model kwargs
+         actor_model_config = AutoConfig.from_pretrained(
+-            local_path, trust_remote_code=trust_remote_code, attn_implementation="flash_attention_2"
++            local_path, trust_remote_code=trust_remote_code,
++            attn_implementation=os.environ.get("R1X4_ATTN_IMPL", "flash_attention_2"),  # sdpa where flash-attn has no kernel
+         )
+ 
+         # patch for kimi-vl
+@@ -789,6 +790,53 @@
+         return output
+     
+     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
++    def compute_hidden_stats(self, data: DataProto):
++        """r1x4 per-token CHES. h_t = final-norm output (the lm_head input) at the position that PREDICTS response token t.
++        meta_info['ches_mode'] == 'sum':   returns ches_sum   [rows, H]  = sum_t h_t over valid response tokens
++        meta_info['ches_mode'] == 'score': needs ches_ref [rows, H]; returns ches_score [rows, R] = <h_t, ref> or cos(h_t, ref)
++        One unpadded row per forward (no attention mask, contiguous positions), so it is backend-agnostic."""
++        assert self._is_actor
++        if self._is_offload_param:
++            load_fsdp_model_to_gpu(self.actor_module_fsdp)
++        mode, score_fn = data.meta_info["ches_mode"], data.meta_info.get("ches_score", "cos")
++        module = self.actor_module_fsdp
++        norm = next(m for n, m in module.named_modules() if n.replace("_fsdp_wrapped_module.", "").endswith("model.norm"))
++        box = {}
++        hook = norm.register_forward_hook(lambda m, i, o: box.__setitem__("h", o))
++        ids_all, am_all = data.batch["input_ids"], data.batch["attention_mask"]
++        R = data.batch["responses"].shape[-1]
++        out = []
++        try:
++            with torch.no_grad(), torch.autocast(device_type=get_device_name(), dtype=torch.bfloat16):
++                for r in range(ids_all.shape[0]):
++                    valid = am_all[r].bool()
++                    ids = ids_all[r][valid].to(get_device_id())[None]
++                    n, n_resp = ids.shape[1], int(am_all[r, -R:].sum())
++                    pos = torch.arange(n, device=ids.device)[None]
++                    module(input_ids=ids, position_ids=pos, use_cache=False, logits_to_keep=1, return_dict=True)  # verl fused-kernel forward needs return_dict
++                    h = box.pop("h")[0, n - n_resp - 1:n - 1].float()  # [n_resp, H]
++                    if mode == "sum":
++                        out.append(h.sum(0).cpu())
++                    else:
++                        ref = data.batch["ches_ref"][r].to(h.device).float()
++                        sc = h @ ref
++                        if score_fn == "cos":
++                            sc = sc / (h.norm(dim=-1) * ref.norm() + 1e-6)
++                        row = torch.zeros(R)
++                        row[:n_resp] = sc.cpu()
++                        out.append(row)
++        finally:
++            hook.remove()
++        key = "ches_sum" if mode == "sum" else "ches_score"
++        output = DataProto.from_dict(tensors={key: torch.stack(out)})
++        if self.world_size > 1 and fsdp_version(self.actor.actor_module) == 1:
++            self.actor.actor_module._handle.reshard(True)
++        if self._is_offload_param:
++            offload_fsdp_model_to_cpu(self.actor_module_fsdp)
++        torch.cuda.empty_cache()
++        return output
++
++    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
+     @DistProfiler.annotate(color="blue", role="actor_compute_log_prob_pr")
+     def compute_log_prob_pr(self, data: DataProto):
+         # when is_lora is True, we use the actor without lora applied to calculate the log_prob
+diff -ruN -x __pycache__ -x outputs verl_orig_ampo_ro/verl/adaptive_mix_src/rl_dataset_with_target.py verl/verl/adaptive_mix_src/rl_dataset_with_target.py
+--- verl_orig_ampo_ro/verl/adaptive_mix_src/rl_dataset_with_target.py	2026-10-18 18:46:22.169484511 -0500
++++ verl/verl/adaptive_mix_src/rl_dataset_with_target.py	2026-10-18 18:58:11.492655651 -0500
+@@ -92,6 +92,9 @@
+         self.target_list_key = target_list_key
+         self.target_probs_key = target_probs_key
+         self.max_num_targets = config.get('max_available_targets', 10)
++        if self.max_num_targets == -1:  # fork: keep EVERY teacher trace (pad to the largest pool in the data)
++            self.max_num_targets = max(len(t) for t in self.dataframe[target_list_key] if t is not None)
++            print(f'[ampo-fork] max_available_targets=-1 -> keeping all targets, max pool {self.max_num_targets}')
+ 
+         self.num_off_policy_targets = config.get('num_off_policy_targets', 2)
+         self.length_strategy = config.get('length_strategy', 'short')  # 'long' or 'short'
+@@ -191,7 +194,9 @@
+                 tgt_input_ids_lst = [torch.zeros_like(tgt_input_ids).fill_(self.tokenizer.pad_token_id)] * self.max_num_targets
+                 
+             else:
+-                if self.length_strategy == 'short':
++                if self.length_strategy == 'none':  # fork: no static preselection; the trainer ranks per update
++                    sorted_target_list = list(target_list)
++                elif self.length_strategy == 'short':
+                     sorted_target_list = sorted(target_list, key=lambda x: x['quality_score'], reverse=True) # sort by quality_score
+                 elif self.length_strategy == 'long':
+                     sorted_target_list = sorted(target_list, key=lambda x: x['quality_score'], reverse=False) # sort by quality_score
+diff -ruN -x __pycache__ -x outputs verl_orig_ampo_ro/verl/r1x4/main_r1x4.py verl/verl/r1x4/main_r1x4.py
+--- verl_orig_ampo_ro/verl/r1x4/main_r1x4.py	1969-12-31 18:00:00.000000000 -0600
++++ verl/verl/r1x4/main_r1x4.py	2026-10-18 19:01:25.515851749 -0500
+@@ -0,0 +1,50 @@
++"""Entry point: python -m verl.r1x4.main_r1x4 <hydra overrides>  (run from the kit's verl/ directory; scripts/run.py builds the call)."""
++import os
++import socket
++
++import hydra
++import ray
++from omegaconf import OmegaConf
++
++
++@hydra.main(config_path="../adaptive_mix_src/config", config_name="mix_dapo_trainer", version_base=None)
++def main(config):
++    if not ray.is_initialized():
++        ray.init(runtime_env={"env_vars": {"TOKENIZERS_PARALLELISM": "true", "NCCL_DEBUG": "WARN", "VLLM_LOGGING_LEVEL": "WARN",
++                                           **{k: v for k, v in os.environ.items() if k.startswith(("R1X4_", "VLLM_", "HF_", "CUDA_"))}}},
++                 num_cpus=config.ray_init.num_cpus)
++    runner = TaskRunner.remote()  # keep the handle: a temporary actor is garbage-collected before run() starts
++    ray.get(runner.run.remote(config))
++
++
++@ray.remote(num_cpus=1)
++class TaskRunner:
++    def run(self, config):
++        from pprint import pprint
++
++        from verl.single_controller.ray import RayWorkerGroup
++        from verl.trainer.ppo.ray_trainer import ResourcePoolManager, Role
++        from verl.utils import hf_tokenizer
++        from verl.utils.fs import copy_to_local
++
++        from verl.adaptive_mix_src.mix_fsdp_worker import MIXActorRolloutRefWorker
++        from .reward import R1x4RewardManager
++        from .trainer import R1x4Trainer
++
++        print(f"TaskRunner {socket.gethostname()} pid {os.getpid()}")
++        OmegaConf.resolve(config)
++        pprint(OmegaConf.to_container(config))
++        tokenizer = hf_tokenizer(copy_to_local(config.actor_rollout_ref.model.path))
++        pool = "global_pool"
++        mgr = ResourcePoolManager(resource_pool_spec={pool: [config.trainer.n_gpus_per_node] * config.trainer.nnodes},
++                                  mapping={Role.ActorRollout: pool})
++        trainer = R1x4Trainer(config=config, tokenizer=tokenizer,
++                              role_worker_mapping={Role.ActorRollout: ray.remote(MIXActorRolloutRefWorker)},
++                              resource_pool_manager=mgr, ray_worker_group_cls=RayWorkerGroup,
++                              reward_fn=R1x4RewardManager(tokenizer), val_reward_fn=R1x4RewardManager(tokenizer))
++        trainer.init_workers()
++        trainer.fit()
++
++
++if __name__ == "__main__":
++    main()
+diff -ruN -x __pycache__ -x outputs verl_orig_ampo_ro/verl/r1x4/reward.py verl/verl/r1x4/reward.py
+--- verl_orig_ampo_ro/verl/r1x4/reward.py	1969-12-31 18:00:00.000000000 -0600
++++ verl/verl/r1x4/reward.py	2026-10-18 18:50:43.592780465 -0500
+@@ -0,0 +1,115 @@
++"""Training/validation grader = reward v4 of our earlier runs: math_verify(parse('$gold$'), parse(whole response)).
++
++math_verify can hang in C code where its signal timeout never fires (it froze validation once), so every text is
++graded in a worker process and a worker that exceeds `timeout` seconds on one text is killed and replaced; that text
++scores -1 (ungraded; the reward manager counts it as 0).
++"""
++import multiprocessing as mp
++import os
++import queue
++import time
++
++import torch
++
++
++def grade_one(text, gold):
++    from math_verify import parse, verify
++    try:
++        g = parse('$' + gold + '$', parsing_timeout=5)
++        return int(bool(verify(g, parse(text, parsing_timeout=5), timeout_seconds=5)))
++    except Exception:
++        return 0
++
++
++def _worker(tasks, results):
++    while True:
++        item = tasks.get()
++        if item is None:
++            return
++        k, text, gold = item
++        results.put(('start', k, os.getpid()))
++        results.put(('done', k, grade_one(text, gold)))
++
++
++def grade_texts(texts, golds, workers=8, timeout=30.0):
++    """1 correct, 0 wrong, -1 ungraded (timeout). Order preserved."""
++    n = len(texts)
++    out = [-1] * n
++    if n == 0:
++        return out
++    ctx = mp.get_context('fork')
++    tasks, results = ctx.Queue(), ctx.Queue()
++    for k in range(n):
++        tasks.put((k, texts[k], golds[k]))
++    procs = {}
++
++    def spawn():
++        p = ctx.Process(target=_worker, args=(tasks, results), daemon=True)
++        p.start()
++        procs[p.pid] = [p, None, 0.0]  # process, current task, start time
++
++    for _ in range(min(workers, n)):
++        spawn()
++    finished = set()
++
++    def finish(k, v):
++        if k not in finished:  # a killed worker's late 'done' must not count twice
++            finished.add(k)
++            out[k] = v
++
++    while len(finished) < n:
++        try:
++            msg = results.get(timeout=1.0)
++            if msg[0] == 'start':
++                if msg[2] in procs:
++                    procs[msg[2]][1:] = [msg[1], time.time()]
++            else:
++                finish(msg[1], msg[2])
++                for v in procs.values():
++                    if v[1] == msg[1]:
++                        v[1] = None
++        except queue.Empty:
++            pass
++        now = time.time()
++        for pid, (p, k, t0) in list(procs.items()):
++            if k is not None and now - t0 > timeout:  # hung: kill, leave -1, replace the worker
++                p.kill()
++                p.join()
++                del procs[pid]
++                finish(k, -1)
++                spawn()
++            elif not p.is_alive() and k is not None:  # died mid-task
++                del procs[pid]
++                finish(k, -1)
++                spawn()
++    for _ in procs:
++        tasks.put(None)
++    for p, _, _ in procs.values():
++        p.join(timeout=5)
++        if p.is_alive():
++            p.kill()
++    return out
++
++
++class R1x4RewardManager:
++    """Drop-in for AMPO's RewardManager(data, return_dict) used by training and _validate."""
++
++    def __init__(self, tokenizer, workers=None, timeout=30.0):
++        self.tokenizer = tokenizer
++        self.workers = workers or max(4, min(32, (len(os.sched_getaffinity(0)) or 8) - 2))
++        self.timeout = timeout
++
++    def decode(self, data):
++        P = data.batch['prompts'].shape[-1]
++        lens = data.batch['attention_mask'][:, P:].sum(-1).tolist()
++        return [self.tokenizer.decode(r[:l], skip_special_tokens=True) for r, l in zip(data.batch['responses'], lens)], lens
++
++    def __call__(self, data, return_dict=False):
++        texts, lens = self.decode(data)
++        golds = [x['ground_truth'] for x in data.non_tensor_batch['reward_model']]
++        scores = grade_texts(texts, golds, self.workers, self.timeout)
++        rt = torch.zeros_like(data.batch['responses'], dtype=torch.float32)
++        for i, (s, l) in enumerate(zip(scores, lens)):
++            rt[i, max(l, 1) - 1] = float(s == 1)
++        res = {'reward_tensor': rt, 'reward_extra_info': {'ungraded': [int(s == -1) for s in scores]}}
++        return res if return_dict else rt
+diff -ruN -x __pycache__ -x outputs verl_orig_ampo_ro/verl/r1x4/trainer.py verl/verl/r1x4/trainer.py
+--- verl_orig_ampo_ro/verl/r1x4/trainer.py	1969-12-31 18:00:00.000000000 -0600
++++ verl/verl/r1x4/trainer.py	2026-10-19 10:00:48.022933602 -0500
+@@ -0,0 +1,531 @@
++"""R1x4 trainer on the AMPO/verl-0.5 stack.
++
++Every step, per prompt: 4 live student rollouts + 4 stored teacher rows, filled to EXACTLY 4 correct / 4 wrong
++(k correct students -> 4-k copies of LUFFY's R1 trace + k distinct stored wrong traces). The group mean is pinned
++at 0.5, so every advantage is exactly +-0.5 (plain GRPO over the 8 rows, no std). Teacher rows are off-policy
++(prefix_mask) and use AMPO's token-level off-policy loss with the p/(p+0.1) reshape, exactly like our LUFFY-tree
++4s4t runs (loss_remove_token_mean, no clip, lr 1e-6, no KL, entropy 1e-3).
++
++Knobs (r1x4.* in the Hydra config, set by scripts/run.py):
++  teacher_token_min_prob p  teacher tokens with pre-update policy probability < p lose their gradient (in the loss)
++  ches.enable               per-token CHES on every negative row: drop the drop_frac of its response tokens whose
++                            final hidden state is most aligned with the group's positive (R1) trace, S+ = sum_t h+_t
++                            (cos or inner product); the shared prefix with y+ is never dropped; >= 1 token is kept
++  rank.enable               curriculum: take the next `pool` (1000) prompts in LUFFY visit order, teacher-force their
++                            R1 trace and their wrong traces under the CURRENT policy, keep the `top` (100) whose traces
++                            are most likely, train on them in DECREASING likelihood, then the next `pool`, and so on
++"""
++import json
++import math
++import os
++import time
++import uuid
++from collections import Counter, defaultdict
++from pprint import pprint
++
++import numpy as np
++import pyarrow.parquet as pq
++import torch
++from omegaconf import OmegaConf, open_dict
++
++from verl import DataProto
++from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
++from verl.trainer.ppo.metric_utils import reduce_metrics
++from verl.utils.dataset.rl_dataset import RLHFDataset, collate_fn
++from verl.utils.model import compute_position_id_with_mask
++import verl.utils.torch_functional as verl_F
++from torchdata.stateful_dataloader import StatefulDataLoader
++
++from verl.adaptive_mix_src.mix_dapo_trainer import MIXRayDAPOTrainer
++
++STUDENTS, TEACHERS, GROUP, CORRECT = 4, 4, 8, 4
++
++
++class Curriculum:
++    """LUFFY visit order over the dataset rows (they are stored sorted by visit), optional likelihood ranking, retirement."""
++
++    def __init__(self, n, rank_pool, rank_top, retire_after):
++        self.n, self.pool, self.top, self.retire_after = n, rank_pool, rank_top, retire_after
++        self.cursor = 0          # next dataset row in visit order (wraps = new epoch)
++        self.epoch = 0
++        self.queue = []          # rows selected and not yet trained, in training order
++        self.wrong_order = {}    # row -> wrong-trace order chosen by the ranking (most likely first)
++        self.retired, self.streak = set(), {}
++
++    def take_window(self, size):
++        out = []
++        while len(out) < size and len(self.retired) < self.n:
++            i = self.cursor
++            self.cursor += 1
++            if self.cursor >= self.n:
++                self.cursor, self.epoch = 0, self.epoch + 1
++            if i not in self.retired:
++                out.append(i)
++        return out
++
++    def observe(self, rows, all_correct):
++        for i, a in zip(rows, all_correct):
++            self.streak[i] = self.streak.get(i, 0) + 1 if a else 0
++            if self.retire_after > 0 and self.streak[i] >= self.retire_after:
++                self.retired.add(i)
++
++    def state_dict(self):
++        return dict(self.__dict__)
++
++    def load_state_dict(self, s):
++        self.__dict__.update(s)
++
++
++class R1x4Data:
++    def __init__(self, path, tokenizer, max_prompt_length, max_response_length, teacher_eos):
++        t = pq.read_table(path)
++        self.rows = t.to_pylist()
++        assert all(a['visit'] <= b['visit'] for a, b in zip(self.rows, self.rows[1:])), 'rows must be sorted by LUFFY visit'
++        self.tok, self.P, self.R, self.eos = tokenizer, max_prompt_length, max_response_length, teacher_eos
++        self._p, self._t = {}, {}
++
++    def __len__(self):
++        return len(self.rows)
++
++    def prompt(self, i):
++        if i not in self._p:
++            text = self.tok.apply_chat_template(self.rows[i]['prompt'], add_generation_prompt=True, tokenize=False)
++            ids, am = verl_F.tokenize_and_postprocess_data(prompt=text, tokenizer=self.tok, max_length=self.P,
++                                                           pad_token_id=self.tok.pad_token_id, left_pad=True, truncation='error')
++            self._p[i] = (text, ids[0], am[0], compute_position_id_with_mask(am)[0])
++        return self._p[i]
++
++    def teacher_ids(self, i, text):
++        """Response token ids of a stored trace: tokens + EOS, cut at R (a prompt ending in '<think>\\n' owns that prefix)."""
++        key = (i, hash(text))
++        if key not in self._t:
++            if self.prompt(i)[0].endswith('<think>\n') and text.startswith('<think>\n'):
++                text = text[len('<think>\n'):]
++            ids = self.tok(text, add_special_tokens=False)['input_ids'] + [self.eos]
++            self._t[key] = torch.tensor(ids[:self.R], dtype=torch.long)
++            if len(self._t) > 200000:
++                self._t.clear()
++        return self._t[key]
++
++
++class _CurriculumState:  # lets RayPPOTrainer._save/_load_checkpoint store the curriculum as 'data.pt'
++    def __init__(self, cur):
++        self.cur = cur
++
++    def state_dict(self):
++        return self.cur.state_dict()
++
++    def load_state_dict(self, s):
++        self.cur.load_state_dict(s)
++
++    def __len__(self):
++        return 1
++
++
++class R1x4Trainer(MIXRayDAPOTrainer):
++    def __init__(self, *args, **kwargs):
++        super().__init__(*args, off_policy_reward_fn=None, **kwargs)
++        self.rc = self.config.r1x4
++        self.rng_seed = int(self.rc.get('seed', 47))
++
++    # ------------------------------------------------------------------ data
++    def _create_dataloader(self):
++        c, d = self.config, self.config.data
++        eos = self.config.r1x4.get('teacher_eos_token', None)
++        eos_id = self.tokenizer.convert_tokens_to_ids(eos) if eos else self.tokenizer.eos_token_id
++        self.data = R1x4Data(d.train_files, self.tokenizer, d.max_prompt_length, d.max_response_length, eos_id)
++        rk = self.config.r1x4.rank
++        self.cur = Curriculum(len(self.data), rk.pool, rk.top, self.config.r1x4.retire_after_all_correct)
++        self.train_dataloader = _CurriculumState(self.cur)
++        self.mu = {}  # variant IV: luffy_index -> [(token_ids, token_logps)] of self-sampled correct teacher traces
++        isamp = self.config.r1x4.isamp
++        if isamp.enable:
++            import glob
++            files = sorted(f for pat in str(isamp.mu_pool).split(',') for f in glob.glob(pat))
++            assert files, f'r1x4.isamp.mu_pool={isamp.mu_pool} matches no file'
++            for f in files:
++                for r in pq.read_table(f).to_pylist():
++                    tr = [(torch.tensor(x['token_ids'], dtype=torch.long), torch.tensor(x['token_logps'], dtype=torch.float32))
++                          for x in (r['traces'] or [])]
++                    if tr:
++                        self.mu[r['luffy_index']] = tr
++            have = sum(1 for r in self.data.rows if r['luffy_index'] in self.mu)
++            print(f'[r1x4] mu pool: {len(files)} files, {len(self.mu)} prompts with a mu-trace ({have} in this dataset)')
++        self.val_dataset = RLHFDataset(data_files=d.val_files, tokenizer=self.tokenizer, config=d)
++        self.val_dataloader = StatefulDataLoader(dataset=self.val_dataset, batch_size=len(self.val_dataset), num_workers=0,
++                                                 shuffle=False, drop_last=False, collate_fn=collate_fn)
++        self.total_training_steps = c.trainer.total_training_steps
++        assert self.total_training_steps, 'set trainer.total_training_steps'
++        with open_dict(c):
++            c.actor_rollout_ref.actor.optim.total_training_steps = self.total_training_steps
++        print(f'[r1x4] train rows {len(self.data)} ({d.train_files}), teacher EOS {self.tokenizer.convert_ids_to_tokens(eos_id)!r}, '
++              f'val {len(self.val_dataset)}, steps {self.total_training_steps}')
++
++    # ------------------------------------------------------------- helpers
++    def _rows_proto(self, prompt_rows, responses):
++        """Teacher-forced rows: left-padded prompt [P] + right-padded response [R]."""
++        R, pad = self.config.data.max_response_length, self.tokenizer.pad_token_id
++        pr = torch.stack([self.data.prompt(i)[1] for i in prompt_rows])
++        pm = torch.stack([self.data.prompt(i)[2] for i in prompt_rows])
++        rs = torch.full((len(responses), R), pad, dtype=torch.long)
++        rm = torch.zeros((len(responses), R), dtype=pm.dtype)
++        for k, r in enumerate(responses):
++            rs[k, :len(r)], rm[k, :len(r)] = r, 1
++        am = torch.cat([pm, rm], -1)
++        return DataProto.from_dict(tensors={'prompts': pr, 'responses': rs, 'input_ids': torch.cat([pr, rs], -1),
++                                            'attention_mask': am, 'position_ids': compute_position_id_with_mask(am)})
++
++    def _wg_call(self, fn, proto, chunk=None):
++        """Call a DP worker method on any number of rows: pad to the DP world size, optionally in chunks."""
++        ws = self.actor_rollout_wg.world_size
++        chunk = chunk or len(proto)
++        outs = []
++        for s in range(0, len(proto), chunk):
++            part = proto.slice(s, min(s + chunk, len(proto))) if len(proto) > chunk else proto
++            part.meta_info.update(proto.meta_info)
++            padded, pad = pad_dataproto_to_divisor(part, ws)
++            outs.append(unpad_dataproto(fn(padded), pad))
++        return DataProto.concat(outs) if len(outs) > 1 else outs[0]
++
++    @staticmethod
++    def _mean_logp(lp, mask):
++        return ((lp * mask).sum(-1) / mask.sum(-1).clamp(min=1)).tolist()
++
++    # ------------------------------------------------------------- ranking
++    def _refill(self, batch_size, metrics, timing):
++        rk = self.rc.rank
++        while len(self.cur.queue) < batch_size:
++            window = self.cur.take_window(rk.pool if rk.enable else batch_size - len(self.cur.queue))
++            if not window:
++                break
++            if not rk.enable:
++                self.cur.queue += window
++                continue
++            t0 = time.time()
++            rows, resp, owner = [], [], []
++            for i in window:
++                r = self.data.rows[i]
++                rows.append(i), resp.append(self.data.teacher_ids(i, r['correct_text'])), owner.append((i, 'pos'))
++                for j, w in enumerate(r['wrong_texts'][:rk.max_neg]):
++                    rows.append(i), resp.append(self.data.teacher_ids(i, w)), owner.append((i, j))
++            proto = self._rows_proto(rows, resp)
++            lp = self._wg_call(self.actor_rollout_wg.compute_log_prob, proto, chunk=rk.chunk).batch['old_log_probs']
++            ml = self._mean_logp(lp, proto.batch['attention_mask'][:, -lp.shape[-1]:].float())
++            pos, neg = {}, defaultdict(list)
++            for (i, j), v in zip(owner, ml):
++                (pos.__setitem__(i, v) if j == 'pos' else neg[i].append((v, j)))
++            score = {}
++            for i in window:
++                best = max(neg[i])[0]
++                score[i] = {'sum': pos[i] + best, 'min': min(pos[i], best), 'pos': pos[i], 'neg': best}[rk.score]
++                self.cur.wrong_order[i] = [j for _, j in sorted(neg[i], reverse=True)]
++            chosen = sorted(window, key=lambda i: -score[i])[:rk.top]  # top-k, in decreasing likelihood
++            self.cur.queue += chosen
++            sc = np.array([score[i] for i in window])
++            metrics.update({'rank/window': len(window), 'rank/score_mean_window': float(sc.mean()),
++                            'rank/score_mean_chosen': float(np.mean([score[i] for i in chosen])),
++                            'rank/pos_logp_chosen': float(np.mean([pos[i] for i in chosen])),
++                            'rank/pos_logp_window': float(np.mean([pos[i] for i in window])),
++                            'rank/cursor': self.cur.cursor, 'rank/epoch': self.cur.epoch})
++            timing['rank'] = timing.get('rank', 0) + time.time() - t0
++            print(f'[r1x4 rank] window {len(window)} -> top {len(chosen)}, score chosen {metrics["rank/score_mean_chosen"]:.3f} '
++                  f'vs window {sc.mean():.3f}, {time.time() - t0:.0f}s', flush=True)
++
++    def _teacher_lambda(self, t, T_a):
++        """p-independent teacher weight at step t (starts at 1): hold H steps at lambda0, then cosine / linear to lambda_min
++        over T_a steps (or constant). Without annealing: 1 (plain R1x4)."""
++        an = self.rc.anneal
++        if not an.enable:
++            return 1.0
++        l0, lmin, H = float(an.lambda0), float(an.get('lambda_min', 0.0)), int(an.get('hold_steps', 0))
++        kind = an.get('schedule', 'cosine')
++        s = t - 1 - H
++        if kind == 'constant' or s < 0:
++            return l0
++        u = min(1.0, s / T_a)
++        if kind == 'linear':
++            return l0 + (lmin - l0) * u
++        return lmin + (l0 - lmin) * 0.5 * (1.0 + math.cos(math.pi * u))
++
++    def _next_rows(self, batch_size, metrics, timing):
++        self._refill(batch_size, metrics, timing)
++        rows, self.cur.queue = self.cur.queue[:batch_size], self.cur.queue[batch_size:]
++        return rows
++
++    # ----------------------------------------------------------- CHES mask
++    def _ches_keep(self, batch, group_rows, adv_row, scores_row, metrics, is_teacher):
++        """Per-token CHES keep mask [rows, R] (1 = keep); only negative rows can lose tokens."""
++        ch = self.rc.ches
++        R = batch.batch['responses'].shape[-1]
++        resp, rmask = batch.batch['responses'], batch.batch['response_mask'].bool()
++        keep = torch.ones_like(resp, dtype=torch.float32)
++        refs, negs = [], []
++        for g, rows in enumerate(group_rows):
++            pos = [r for r in rows if scores_row[r] == 1 and rmask[r].any()]
++            neg = [r for r in rows if adv_row[r] < 0 and rmask[r].any()
++                   and (ch.rows == 'all' or bool(is_teacher[r]) == (ch.rows == 'teacher'))]
++            if pos and neg:
++                refs.append(pos[0])  # teacher rows come first: the R1 trace when one is in the group
++                negs += [(r, pos[0]) for r in neg]
++        if not negs:
++            return keep
++        sel = lambda idx: batch.select(batch_keys=['prompts', 'responses', 'input_ids', 'attention_mask', 'position_ids']).select_idxs(idx)
++        p1 = sel(refs)
++        p1.meta_info = {'ches_mode': 'sum'}
++        ssum = self._wg_call(self.actor_rollout_wg.compute_hidden_stats, p1).batch['ches_sum']
++        ref_of = {r: ssum[k] for k, r in enumerate(refs)}
++        p2 = sel([r for r, _ in negs])
++        p2.batch['ches_ref'] = torch.stack([ref_of[p] for _, p in negs])
++        p2.meta_info = {'ches_mode': 'score', 'ches_score': ch.score}
++        score = self._wg_call(self.actor_rollout_wg.compute_hidden_stats, p2).batch['ches_score']
++        dropped = cand_n = 0
++        for k, (r, p) in enumerate(negs):
++            m = rmask[r]
++            # shared response prefix with y+ cancels between the + and - terms: never drop it
++            L = min(int(m.sum()), int(rmask[p].sum()))
++            same = (resp[r, :L] == resp[p, :L]).long().cumprod(0)
++            cand = m.clone()
++            cand[:L] &= ~same.bool()
++            nk = int(ch.drop_frac * int(cand.sum()))
++            if nk > 0:
++                s = score[k].masked_fill(~cand, -float('inf'))
++                top = s.topk(nk).indices
++                keep[r, top] = 0
++            if not (keep[r].bool() & m).any():  # never drop a whole response: keep its lowest-score token
++                keep[r, score[k].masked_fill(~m, float('inf')).argmin()] = 1
++            dropped += int(((keep[r] == 0) & m).sum())
++            cand_n += int(m.sum())
++        metrics.update({'ches/neg_rows': len(negs), 'ches/drop_frac_of_neg_tokens': dropped / max(cand_n, 1)})
++        return keep
++
++    # --------------------------------------------------------------- fit
++    def fit(self):
++        from verl.utils.tracking import Tracking
++        logger = Tracking(project_name=self.config.trainer.project_name, experiment_name=self.config.trainer.experiment_name,
++                          default_backend=self.config.trainer.logger, config=OmegaConf.to_container(self.config, resolve=True))
++        self.global_steps = 0
++        self._load_checkpoint()
++        if self.val_reward_fn is not None and self.config.trainer.get('val_before_train', True) and self.global_steps == 0:
++            vm = self._validate()
++            vm['val/avg_score'] = float(np.mean([v for k, v in vm.items() if k.startswith('val/test_score/')]))
++            pprint(vm)
++            logger.log(data=vm, step=0)
++            if self.config.trainer.get('val_only', False):
++                return
++        B, P = self.config.data.train_batch_size, self.config.data.max_prompt_length
++        dump_dir = self.config.trainer.get('rollout_data_dir', None)
++        self.global_steps += 1
++        while self.global_steps <= self.total_training_steps:
++            metrics, timing, t_step = {}, {}, time.time()
++            rows = self._next_rows(B, metrics, timing)
++            if len(rows) < B:
++                print('[r1x4] dataset exhausted (every prompt retired)')
++                break
++            # ---- students
++            gen = collate_fn([{'input_ids': self.data.prompt(i)[1], 'attention_mask': self.data.prompt(i)[2],
++                               'position_ids': self.data.prompt(i)[3],
++                               'raw_prompt_ids': self.data.prompt(i)[1][self.data.prompt(i)[2].bool()].tolist()} for i in rows])
++            gen = DataProto.from_single_dict(gen)
++            gen.meta_info = {'global_steps': self.global_steps, 'do_sample': True, 'validate': False}
++            t0 = time.time()
++            out = self.actor_rollout_wg.generate_sequences(gen.repeat(STUDENTS, interleave=True))
++            out.meta_info.pop('timing', None)
++            timing['gen'] = time.time() - t0
++            out.non_tensor_batch['reward_model'] = np.array([self.data.rows[i]['reward_model'] for i in rows for _ in range(STUDENTS)], dtype=object)
++            t0 = time.time()
++            s_scores = self.reward_fn(out, return_dict=True)['reward_tensor'].sum(-1).round().long().view(B, STUDENTS)
++            # ---- teacher weight lambda_t (variant IV): p-independent schedule on the step counter; lambda = 0 -> no teacher rows
++            an, isamp = self.rc.anneal, self.rc.isamp
++            layout, K_app = self.rc.get('layout', 'r1x4'), int(self.rc.get('k_teacher', 2))
++            t = self.global_steps
++            T_a = max(1, round(an.frac * self.total_training_steps)) if an.enable else None
++            lam = self._teacher_lambda(t, T_a)
++            teacher_on = lam > 0
++            T = (TEACHERS if layout == 'r1x4' else K_app) if teacher_on else 0
++            G = STUDENTS + T
++            plan, t_mu, t_kind = [], [], []
++            if teacher_on:
++                t_rows, t_resp = [], []
++                for p, i in enumerate(rows):
++                    r, k = self.data.rows[i], int(s_scores[p].sum())
++                    mu = self.mu.get(r['luffy_index'], []) if isamp.enable else []
++                    rng = np.random.default_rng([self.rng_seed, self.global_steps, p])
++                    if layout == 'r1x4':  # k correct students -> (4-k) correct teachers + k distinct wrong traces
++                        order = self.cur.wrong_order.get(i) if self.rc.rank.enable else None
++                        if order is None:
++                            order = list(rng.permutation(len(r['wrong_texts'])))
++                        n_pos, wr = CORRECT - k, [order[m % len(order)] for m in range(k)]  # cycled if fewer distinct
++                        pos_pick = list(range(n_pos))                                     # distinct mu-traces, cycled
++                    else:                 # append: K positive rows, uniform over the prompt's correct traces, never p-dependent
++                        n_pos, wr = K_app, []
++                        pos_pick = list(rng.choice(max(len(mu), 1), K_app, replace=len(mu) < K_app))
++                    for c in pos_pick:
++                        t_rows.append(i), t_kind.append(1)
++                        if mu:  # self-sampled correct trace with its log mu
++                            ids, lps = mu[c % len(mu)]
++                            t_resp.append(ids[:self.data.R]), t_mu.append(lps[:self.data.R])
++                        else:   # no mu-trace for this prompt: LUFFY's R1 trace with the p/(p+0.1) shaping
++                            t_resp.append(self.data.teacher_ids(i, r['correct_text'])), t_mu.append(None)
++                    for j in wr:
++                        t_rows.append(i), t_resp.append(self.data.teacher_ids(i, r['wrong_texts'][j])), t_kind.append(0), t_mu.append(None)
++                    plan.append(len(wr))
++                tb = self._rows_proto(t_rows, t_resp)
++                tb.non_tensor_batch['reward_model'] = np.array([self.data.rows[i]['reward_model'] for i in t_rows], dtype=object)
++                t_scores = self.reward_fn(tb, return_dict=True)['reward_tensor'].sum(-1).round().long().view(B, T)
++                kinds = torch.tensor(t_kind).view(B, T)
++                bad = (t_scores != kinds).any(-1)  # a stored trace graded against its label: the group trains nothing
++            else:
++                t_scores, bad = torch.zeros(B, 0, dtype=torch.long), torch.zeros(B, dtype=torch.bool)
++            timing['reward'] = time.time() - t0
++            # ---- assemble groups [T teachers, 4 students], contiguous
++            sb = out.select(batch_keys=['prompts', 'responses', 'input_ids', 'attention_mask', 'position_ids'])
++            sb.non_tensor_batch = {}
++            idx_s = torch.arange(B * STUDENTS).view(B, STUDENTS)
++            if teacher_on:
++                tb.non_tensor_batch = {}
++                idx_t = torch.arange(B * T).view(B, T)
++                both = DataProto.concat([tb, sb])
++                order_rows = torch.cat([torch.cat([idx_t[p], B * T + idx_s[p]]) for p in range(B)]).tolist()
++                batch = both.select_idxs(order_rows)
++            else:
++                batch = sb
++            R = batch.batch['responses'].shape[-1]
++            scores_row = torch.cat([torch.cat([t_scores[p], s_scores[p]]) for p in range(B)]).float()
++            is_teacher = torch.tensor(([1] * T + [0] * STUDENTS) * B, dtype=torch.bool)
++            rmask = batch.batch['attention_mask'][:, -R:].clone()
++            group_ok = (~bad).repeat_interleave(G)
++            rmask[~group_ok] = 0
++            batch.batch['response_mask'] = rmask
++            batch.batch['prefix_mask'] = rmask.bool() & is_teacher[:, None]
++            lens = batch.batch['attention_mask'][:, -R:].sum(-1)
++            tls = torch.zeros(len(batch), R)
++            tls[torch.arange(len(batch)), (lens - 1).clamp(min=0)] = scores_row
++            batch.batch['token_level_scores'] = batch.batch['token_level_rewards'] = tls
++            # baseline: R1x4 = mean of all G rows (pinned 0.5 for 4C/4W); 'student' = mean of the 4 student rows (Dr.GRPO /
++            # grpo_split). After the teacher phase both are the student mean, i.e. GRPO-4.
++            sg = scores_row.view(B, G)
++            base = sg[:, T:].mean(-1, keepdim=True) if self.rc.get('baseline', 'group') == 'student' else sg.mean(-1, keepdim=True)
++            adv_row = (sg - base).view(-1) * group_ok.float()
++            if teacher_on and an.enable:  # teacher rows: x lambda_t x gate x neg weight x optional length normalisation
++                gate = (s_scores.sum(-1) == 0).float() if an.gate == 'all_fail' else torch.ones(B)
++                tw = lam * gate.repeat_interleave(G)
++                tw = torch.where(scores_row < 0.5, tw * float(an.get('neg_weight', 1.0)), tw)
++                if an.len_ref > 0:
++                    tw = tw * (an.len_ref / lens.clamp(min=1).float())
++                adv_row = torch.where(is_teacher, adv_row * tw, adv_row)
++            batch.batch['advantages'] = adv_row[:, None] * rmask.float()
++            if isamp.enable:
++                tl, tm = torch.zeros(len(batch), R), torch.zeros(len(batch), R, dtype=torch.bool)
++                for q, lps in enumerate(t_mu):
++                    if lps is not None:
++                        row = (q // T) * G + q % T
++                        tl[row, :len(lps)], tm[row, :len(lps)] = lps, True
++                batch.batch['teacher_logp'], batch.batch['teacher_mu_mask'] = tl, tm & rmask.bool()
++            batch.non_tensor_batch['uid'] = np.array([str(i) for i in rows for _ in range(G)], dtype=object)
++            batch.meta_info['global_token_num'] = batch.batch['attention_mask'].sum(-1).tolist()
++            # ---- pre-update policy log-probs (p filter uses them; on-policy ratio baseline)
++            t0 = time.time()
++            olp = self.actor_rollout_wg.compute_log_prob(batch)
++            ent = olp.batch.pop('entropys')
++            batch = batch.union(olp)
++            timing['old_log_prob'] = time.time() - t0
++            if self.rc.ches.enable:
++                t0 = time.time()
++                group_rows = [list(range(g * G, (g + 1) * G)) for g in range(B)]
++                batch.batch['ches_keep'] = self._ches_keep(batch, group_rows, adv_row, scores_row, metrics, is_teacher)
++                timing['ches'] = time.time() - t0
++            if an.enable:
++                switch = lam == 0 and self._teacher_lambda(t - 1, T_a) > 0  # the step the teacher term turns off
++                batch.meta_info['reset_optim'] = bool(an.reset_adam and switch)
++                batch.meta_info['teacher_diag'] = bool(teacher_on and an.diag_every and (t - 1) % an.diag_every == 0)
++                if not teacher_on:
++                    assert not batch.batch['prefix_mask'].any()
++                tr = is_teacher & group_ok
++                metrics.update({'teacher/lambda': lam, 'teacher/rows': int(tr.sum()), 'teacher/T_a': T_a,
++                                'teacher/neg_rows': int((tr & (scores_row < 0.5)).sum()),
++                                'teacher/gate_frac': float((s_scores.sum(-1) == 0).float().mean()) if teacher_on else 0.0,
++                                'teacher/len_mean': float(lens[tr].float().mean()) if tr.any() else 0.0,
++                                'teacher/adam_reset': int(batch.meta_info['reset_optim'])})
++            if teacher_on:  # per-token gradient weight on teacher tokens (IS rho_bar or LUFFY's 0.1p/(p+0.1)^2) and its pull
++                tok_t = batch.batch['prefix_mask'] & rmask.bool()
++                lp = batch.batch['old_log_probs'].float()
++                pp = lp.exp()
++                W = 0.1 * pp / (pp + 0.1) ** 2
++                if isamp.enable:
++                    tm = batch.batch['teacher_mu_mask']
++                    lr = (lp - batch.batch['teacher_logp']).clamp(min=float(isamp.get('logratio_min', -20.0)))
++                    W = torch.where(tm, lr.clamp(max=math.log(isamp.cbar)).exp(), W)
++                    metrics['is/rows_with_mu'] = int(tm.any(-1).sum())
++                    metrics['is/rows_without_mu_correct'] = int(sum(1 for q, l in enumerate(t_mu) if l is None and t_kind[q] == 1))
++                    if tm.any():
++                        rb = lr.clamp(max=math.log(isamp.cbar)).exp() * tm
++                        v = lr[tm]
++                        qv = v[torch.randperm(v.numel())[:1_000_000]]
++                        ess = (rb.sum(-1) ** 2 / (tm.sum(-1).clamp(min=1) * (rb ** 2).sum(-1).clamp(min=1e-12)))[tm.any(-1)]
++                        metrics.update({'is/rho_mean': float(rb.sum() / tm.sum()), 'is/frac_trunc': float((v > math.log(isamp.cbar)).float().mean()),
++                                        'is/token_ess': float(ess.mean()), 'is/log_ratio_mean': float(v.mean()),
++                                        'is/log_ratio_p05': float(qv.quantile(0.05)), 'is/log_ratio_p50': float(qv.quantile(0.5)),
++                                        'is/log_ratio_p95': float(qv.quantile(0.95))})
++                A = batch.batch['advantages'].abs()
++                st = rmask.bool() & ~batch.batch['prefix_mask']
++                metrics.update({'teacher/token_weight_mean': float(W[tok_t].mean()) if tok_t.any() else 0.0,
++                                'teacher/pull_ratio': float((A * W * tok_t).sum() / (A * st).sum().clamp(min=1e-8)),
++                                'loss/teacher_token_frac': float(tok_t.sum() / rmask.sum().clamp(min=1))})
++            acc_p = s_scores.float().mean(-1)
++            metrics.update({'student/solve_none_frac': float((acc_p == 0).float().mean()), 'student/solve_all_frac': float((acc_p == 1).float().mean())})
++            batch.meta_info['temperature'] = self.config.actor_rollout_ref.rollout.temperature
++            t0 = time.time()
++            upd = self.actor_rollout_wg.update_actor(batch)
++            timing['update_actor'] = time.time() - t0
++            metrics.update(reduce_metrics(upd.meta_info['metrics']))
++            # ---- bookkeeping
++            self.cur.observe(rows, (s_scores.sum(-1) == STUDENTS).tolist())
++            sl = lens.view(B, G)[:, T:].float()
++            eos_set = self.config.r1x4.get('student_eos_ids') or [self.tokenizer.eos_token_id]
++            sresp = out.batch['responses']
++            term = torch.zeros(len(sresp), dtype=torch.bool)
++            for e in eos_set:
++                term |= (sresp == e).any(-1)
++            m = rmask.float()
++            metrics.update({
++                'train/student_acc': s_scores.float().mean().item(),
++                'train/prompts_any_correct': (s_scores.sum(-1) > 0).float().mean().item(),
++                'train/prompts_all_correct': (s_scores.sum(-1) == STUDENTS).float().mean().item(),
++                'train/wrong_teachers_per_group': float(np.mean(plan)) if plan else 0.0,
++                'train/groups_dropped_label_mismatch': int(bad.sum()),
++                'train/student_len_mean': sl.mean().item(),
++                'train/student_clip_rate': (sl >= R).float().mean().item(),
++                'train/student_termination_rate': term.float().mean().item(),
++                'train/teacher_len_mean': lens.view(B, G)[:, :T].float().mean().item() if T else 0.0,
++                'train/adv_abs_mean': (batch.batch['advantages'].abs() * m).sum().item() / max(m.sum().item(), 1),
++                'actor/entropy_pre_update': ((ent * m).sum() / m.sum().clamp(min=1)).item(),
++                'train/student_entropy_pre_update': ((ent * m * (~is_teacher)[:, None]).sum() / (m * (~is_teacher)[:, None]).sum().clamp(min=1)).item(),
++                'train/retired': len(self.cur.retired), 'train/cursor': self.cur.cursor, 'train/epoch': self.cur.epoch,
++                'train/first_visit_in_batch': int(min(self.data.rows[i]['visit'] for i in rows)),
++            })
++            if dump_dir:
++                os.makedirs(dump_dir, exist_ok=True)
++                with open(os.path.join(dump_dir, f'{self.global_steps}.jsonl'), 'w') as f:
++                    texts = self.tokenizer.batch_decode(sresp, skip_special_tokens=True)
++                    for p, i in enumerate(rows):
++                        for s in range(STUDENTS):
++                            f.write(json.dumps({'step': self.global_steps, 'luffy_index': self.data.rows[i]['luffy_index'],
++                                                'visit': self.data.rows[i]['visit'], 'student': s, 'score': int(s_scores[p, s]),
++                                                'len': int(sl[p, s]), 'text': texts[p * STUDENTS + s]}) + '\n')
++            last = self.global_steps >= self.total_training_steps
++            tf, sf = self.config.trainer.test_freq, self.config.trainer.save_freq
++            if self.val_reward_fn is not None and tf > 0 and (last or self.global_steps % tf == 0):
++                t0 = time.time()
++                vm = self._validate()
++                vm['val/avg_score'] = float(np.mean([v for k, v in vm.items() if k.startswith('val/test_score/')]))
++                metrics.update(vm)
++                timing['testing'] = time.time() - t0
++            if sf > 0 and (last or self.global_steps % sf == 0):
++                t0 = time.time()
++                self._save_checkpoint()
++                timing['save'] = time.time() - t0
++            timing['step'] = time.time() - t_step
++            metrics.update({f'timing_s/{k}': v for k, v in timing.items()})
++            logger.log(data=metrics, step=self.global_steps)
++            self.global_steps += 1
++        print('[r1x4] training finished', flush=True)
+diff -ruN -x __pycache__ -x outputs verl_orig_ampo_ro/verl/workers/config/actor.py verl/verl/workers/config/actor.py
+--- verl_orig_ampo_ro/verl/workers/config/actor.py	2026-10-18 18:46:21.484208701 -0500
++++ verl/verl/workers/config/actor.py	2026-10-19 10:01:09.323439072 -0500
+@@ -142,6 +142,12 @@
+     sft_loss_coef: float = 1.0
+     use_sft_multitask_loss: bool = False
+     num_off_policy_targets: int = 2
++    teacher_token_min_prob: float = 0.0        # r1x4: drop teacher tokens with pre-update p < this (0 = off)
++    teacher_token_min_prob_rows: str = "all"    # all | pos | neg
++    loss_row_mean_fix: bool = False             # per-row weight 1/(L*mini) also under dynamic bsz
++    is_cbar: float = 1.0                        # r1x4 variant IV: truncation of the per-token IS ratio
++    is_logratio_min: float = -20.0              # r1x4 variant IV: lower clamp on log(pi/mu) (fp32)
++    entropy_student_only: bool = False          # entropy bonus on student tokens only (teacher tokens masked)
+  
+     def __post_init__(self):
+         """Validate actor configuration parameters."""

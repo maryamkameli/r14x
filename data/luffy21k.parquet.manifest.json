@@ -1,0 +1,21 @@
+{
+ "set": "luffy21k",
+ "rows": 20798,
+ "dropped": {
+  "not in LUFFY visit order (prompt filter)": 8,
+  "wrong traces graded correct/ungraded (trace dropped)": 51,
+  "R1 not graded correct": 136,
+  "no wrong trace left": 18
+ },
+ "first_visits": null,
+ "max_wrong": 8,
+ "wrong_distinct_hist": {
+  "4": 14798,
+  "3": 1831,
+  "1": 3200,
+  "2": 969
+ },
+ "qwen3_prefix": null,
+ "verified": true,
+ "grader": "reward v4: math_verify(parse($gold$), parse(response)), response cut to max_response_length tokens"
+}

@@ -1,0 +1,24 @@
+{
+ "set": "core",
+ "rows": 38145,
+ "dropped": {
+  "wrong traces graded correct/ungraded (trace dropped)": 24,
+  "R1 not graded correct": 284,
+  "no wrong trace left": 15
+ },
+ "first_visits": 39000,
+ "max_wrong": 8,
+ "wrong_distinct_hist": {
+  "4": 4977,
+  "3": 4161,
+  "1": 17740,
+  "2": 7303,
+  "8": 1649,
+  "7": 483,
+  "6": 796,
+  "5": 1036
+ },
+ "qwen3_prefix": null,
+ "verified": true,
+ "grader": "reward v4: math_verify(parse($gold$), parse(response)), response cut to max_response_length tokens"
+}

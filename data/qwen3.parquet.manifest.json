@@ -1,0 +1,23 @@
+{
+ "set": "qwen3",
+ "rows": 12365,
+ "dropped": {
+  "wrong traces graded correct/ungraded (trace dropped)": 0,
+  "R1 not graded correct": 64
+ },
+ "first_visits": 39000,
+ "max_wrong": 8,
+ "wrong_distinct_hist": {
+  "4": 995,
+  "1": 2704,
+  "8": 4205,
+  "3": 1065,
+  "2": 1530,
+  "5": 625,
+  "6": 658,
+  "7": 583
+ },
+ "qwen3_prefix": "qwen3-0.6b",
+ "verified": true,
+ "grader": "reward v4: math_verify(parse($gold$), parse(response)), response cut to max_response_length tokens"
+}
