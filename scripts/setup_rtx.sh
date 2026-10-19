@@ -14,9 +14,21 @@ if ! conda env list | grep -q "^$R1X4_ENV "; then
 fi
 eval "$(conda shell.bash hook)"; conda activate "$R1X4_ENV"
 python -m pip install -U pip wheel setuptools packaging ninja
-python -m pip install "vllm==${VLLM_VERSION:-0.9.2}"
+# PyPI's plain torch 2.7.x wheels are cu126 (no sm_120 kernels): the cu128 index supplies torch X+cu128 (sorts above X).
+CU128=https://download.pytorch.org/whl/cu128
+python -m pip install "vllm==${VLLM_VERSION:-0.9.2}" --extra-index-url "$CU128"
+if [ "$(python -c 'import torch; print(torch.version.cuda or "")')" != 12.8 ]; then  # env built before this fix: swap the build
+  PINS=$(python -c 'import importlib.metadata as m
+for p in ["torch", "torchvision", "torchaudio", "xformers"]:
+    try: print(p + "==" + m.version(p).split("+")[0])
+    except m.PackageNotFoundError: pass')
+  python -m pip install --force-reinstall --no-deps $PINS --index-url "$CU128"
+  python -m pip install $(echo "$PINS" | sed '1s/$/+cu128/') --extra-index-url "$CU128"  # cu128 nvidia-* runtime libs
+fi
+# hydra-core 1.3 / omegaconf 2.3 need antlr4 runtime 4.9.*: with math-verify's antlr4_13_2 extra pip backtracks to
+# hydra-core 0.11 + omegaconf 1.4 (no omegaconf.MISSING, verl fails to import). latex2sympy2_extended ships a 4.9.3 parser.
 python -m pip install "transformers==4.51.3" "tensordict==0.8.3" "ray[default]==2.46.0" "torchdata==0.11.0" \
-  hydra-core codetiming pylatexenc "math-verify[antlr4_13_2]==0.8.0" latex2sympy2_extended datasets pyarrow pandas peft \
+  "hydra-core==1.3.2" "omegaconf==2.3.0" "antlr4-python3-runtime==4.9.3" codetiming pylatexenc "math-verify[antlr4_9_3]==0.8.0" latex2sympy2_extended datasets pyarrow pandas peft \
   accelerate tensorboard "protobuf>=5.28" dill pybind11 psutil einops "numpy<2.3"
 python -m pip install -e "$KIT/verl" --no-deps
 

@@ -1,5 +1,5 @@
 """Run R1x4Trainer.fit() for 4 steps on CPU with mocked workers (variant IV: T_a=2). Checks the batches sent to update_actor."""
-import sys, math, types, torch, numpy as np
+import os, sys, math, types, torch, numpy as np
 sys.path.insert(0, '.')
 from omegaconf import OmegaConf
 from transformers import AutoTokenizer
@@ -23,7 +23,8 @@ if APPEND:
     cfg.r1x4.rank = {'enable': True, 'pool': 16, 'top': 8, 'max_neg': 4, 'score': 'sum', 'chunk': 64}
 tr = R1x4Trainer.__new__(R1x4Trainer)
 tr.config, tr.tokenizer, tr.rc, tr.rng_seed, tr.total_training_steps, tr.val_reward_fn = cfg, tok, cfg.r1x4, 47, 4, None
-tr.data = R1x4Data('/scratch.global/radke149/r1x4_runs/smoke/data/smoke.parquet', tok, P, R, tok.convert_tokens_to_ids('<|im_end|>'))
+DATA = os.environ.get('R1X4_TEST_DATA', os.path.join(os.environ.get('R1X4_ROOT', '/mnt/data/radke149/r1x4'), 'data', 'core.parquet'))
+tr.data = R1x4Data(DATA, tok, P, R, tok.convert_tokens_to_ids('<|im_end|>'))
 tr.cur = Curriculum(len(tr.data), 1000, 100, 2); tr.train_dataloader = _CurriculumState(tr.cur)
 tr.mu = {}
 for i, r in enumerate(tr.data.rows[:12]):               # fake mu-traces for half the prompts: R1 ids with random log-probs
