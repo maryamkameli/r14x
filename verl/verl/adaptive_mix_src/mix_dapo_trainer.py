@@ -421,6 +421,16 @@ class MIXRayDAPOTrainer(RayPPOTrainer):
             collate_fn=collate_fn,
             sampler=sampler,
         )
+        self.pool_selector = None
+        ps = self.config.data.get('pool_select', None)
+        if ps is not None and ps.enable:
+            from .pool_select import RollingPoolSelector
+            assert 'prob' not in self.reward_manager, "pool_select replaces the train dataloader; the 'prob' scoreA pass needs it"
+            self.pool_selector = RollingPoolSelector(self, self.train_dataset, pool=ps.pool, top=ps.top,
+                                                     batch_size=self.config.data.get("gen_batch_size", self.config.data.train_batch_size),
+                                                     chunk=ps.chunk, shuffle=self.config.data.shuffle)
+            self.train_dataloader = self.pool_selector
+            print(f'[pool_select] rolling pool {ps.pool} -> top {ps.top} by teacher-forced loglik, batch {self.pool_selector.batch_size}')
     
         if 'prob' in self.reward_manager:
             from torch.utils.data import ConcatDataset
@@ -722,7 +732,7 @@ class MIXRayDAPOTrainer(RayPPOTrainer):
         
         for epoch in range(self.config.trainer.total_epochs):
             for batch_dict in self.train_dataloader:
-                metrics = {}
+                metrics = self.pool_selector.pop_metrics() if self.pool_selector is not None else {}
 
                 with marked_timer("start_profile", timing_raw):
                     self._start_profiling(

@@ -23,6 +23,11 @@ data:
   length_strategy: short  # long/short
   num_off_policy_targets: 2  
   max_available_targets: 8            
+  pool_select:          # rolling pool: score `pool` next-in-line prompts by teacher-forced loglik, train the `top`, keep the rest
+    enable: False
+    pool: 1000
+    top: 100
+    chunk: 256           # prompts per compute_log_prob call while scoring
 
 actor_rollout_ref:
   actor:

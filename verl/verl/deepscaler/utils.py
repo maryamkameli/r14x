@@ -7,16 +7,7 @@ import time
 from typing import List, Union
 
 import torch
-import vertexai
 import openai
-from google.cloud.aiplatform_v1beta1.types.content import SafetySetting
-from vertexai.generative_models import (
-    GenerationConfig,
-    GenerativeModel,
-    HarmBlockThreshold,
-    HarmCategory
-)
-from sentence_transformers import SentenceTransformer, util
 
 from verl.deepscaler.globals import GCP_PROJECT_ID, GCP_LOCATION, GEMINI_MODEL, OAI_RM_MODEL
 
@@ -100,6 +91,10 @@ def call_gemini_llm(
     Raises:
         NotImplementedError: If API access is denied
     """
+    # Vertex AI SDK is only needed for this LLM-judge path; importing it at module level broke every reward import
+    import vertexai
+    from google.cloud.aiplatform_v1beta1.types.content import SafetySetting
+    from vertexai.generative_models import GenerationConfig, GenerativeModel, HarmBlockThreshold, HarmCategory
     vertexai.init(project=project_id, location=location)
 
     harm_categories = [
@@ -166,6 +161,8 @@ class RAG:
             docs: List of documents to encode
             model: SentenceTransformer model name
         """
+        from sentence_transformers import SentenceTransformer
+
         self.model = SentenceTransformer(model)
         self.docs = docs
         self.embeddings = self.model.encode(docs, convert_to_tensor=True)
@@ -181,6 +178,8 @@ class RAG:
             List of dicts containing similarity scores and document texts
         """
         query_embedding = self.model.encode(query, convert_to_tensor=True)
+        from sentence_transformers import util
+
         cos_scores = util.cos_sim(query_embedding, self.embeddings)[0]
         top_results = torch.topk(cos_scores, k=k)
 
