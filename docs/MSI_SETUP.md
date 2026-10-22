@@ -34,6 +34,29 @@ needs `data/src/` = `openr1.parquet`, `visit_order_rows.txt`, `luffy21k_r1x4.par
 `negatives_extended.jsonl`. `valid.parquet` (2,019 problems) is not produced by `build_datasets.py`. A smoke set is just the
 first rows of core: `python -c "import pandas as p; p.read_parquet('core.parquet').head(64).to_parquet('smoke.parquet')"`.
 
+### Data already downloaded on MSI (pinned to the HF commit, so the row order is fixed)
+| file under `$R1X4_ROOT/data/` | source | rows |
+|---|---|---|
+| `src/openr1.parquet` | `Elliott/Openr1-Math-46k-8192` @ `bd025079` (LUFFY's train set, 1 R1 trace/prompt), sha256 `33c2c51a…57bf84` | 45,792 |
+| `ampo/openr1_math_4longcots.parquet` | `SII-Enigma/OpenR1-Math-4LongCoTs-8.5k` @ `2328db27` (= AMPO `data/prepare_train.py`) | 8,491 |
+| `ampo/valid.parquet`, `valid.parquet` | AMPO repo `data/valid.parquet` (AIME24, AMC, MATH-500, Minerva, OlympiadBench) | 2,019 |
+
+Still missing for R1x4 (`run.py`): `data/src/visit_order_rows.txt`, `luffy21k_r1x4.parquet`, `usable_negatives.jsonl`,
+`negatives_extended.jsonl` (the stored wrong traces), so `build_datasets.py` cannot run yet.
+
+### Prompt order = upstream AMPO
+AMPO (and LUFFY, same class) visits prompts with `ResumableRandomSampler`: one `torch.Generator` seeded 47, epoch *e*
+= the *e*-th `torch.randperm(n)` from it, `train_batch_size` prompts per step, `drop_last=True`. This kit uses the same
+sampler, dataset class, `filter_overlong_prompts=False`, `data.shuffle=True` and 128 prompts/step (`run_ampo.py`), so an
+uninterrupted run sees the prompts in exactly the upstream order. Conditions:
+- same parquet bytes (row order defines the permutation), same `data.train_batch_size` (128); `--pool` changes the order
+  by design (likelihood selection), so do not use it for the reproduction run;
+- **resume fix**: upstream's sampler has `get_state/set_state` but not `state_dict/load_state_dict`, so torchdata's
+  `StatefulDataLoader` could not restore it and replayed epoch 0's permutation after a resume past epoch 1 (measured:
+  resume at step 73 -> step 74 differed). Added `state_dict/load_state_dict` (sampling unchanged).
+- test: `cd verl && python -m pytest -q ../r1x4_tests/test_ampo_order.py` (uninterrupted + resumed at steps 10, 66,
+  73, 162, with 0 and 8 dataloader workers, against the seed-47 reference).
+
 ## 3. Smoke test, then real runs
 ```bash
 sbatch scripts/smoke_msi.sbatch                 # 3 steps of variant I, Qwen3-1.7B, 1 A100 -> SMOKE_EXIT 0

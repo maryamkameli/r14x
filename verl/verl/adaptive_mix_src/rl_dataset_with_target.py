@@ -358,3 +358,14 @@ class ResumableRandomSampler(torch.utils.data.Sampler):
         self.perm = state["perm"]
         self.perm_index = state["perm_index"]
         self.generator.set_state(state["generator_state"])
+
+    # fix (resume order): torchdata's StatefulDataLoader only saves/restores samplers that implement the Stateful
+    # protocol (state_dict/load_state_dict). With get_state/set_state alone it falls back to "fresh sampler (seed 47)
+    # + skip the samples already yielded in the CURRENT epoch", which replays epoch 0's permutation after any resume
+    # past the first epoch. Sampling is unchanged; an uninterrupted run gives the exact upstream AMPO/LUFFY order,
+    # and a resumed run now continues it (r1x4_tests/test_ampo_order.py).
+    def state_dict(self):
+        return {"perm": self.perm.clone(), "perm_index": self.perm_index, "generator_state": self.generator.get_state()}
+
+    def load_state_dict(self, state):
+        self.set_state(state)
