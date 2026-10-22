@@ -35,7 +35,8 @@ from vllm import LLM, SamplingParams
 llm = LLM('Qwen/Qwen3-1.7B', gpu_memory_utilization=0.3, max_model_len=4096, enforce_eager=True)
 o = llm.generate(['<|im_start|>user\nWhat is 7*6? Put the answer in \\boxed{}.<|im_end|>\n<|im_start|>assistant\n'],
                  SamplingParams(max_tokens=512, temperature=0.6))
-print('vLLM OK:', o[0].outputs[0].text[-200:])
+print('vLLM OK:', o[0].outputs[0].text[-200:], flush=True)
+import os; os._exit(0)  # vLLM V1 engine threads keep the interpreter alive after the test (same as gen_teacher_mu.py)
 EOF
 VRC=$?
 python -c "

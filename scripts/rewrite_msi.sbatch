@@ -18,4 +18,12 @@ for M in ${MODELS:-qwen3-0.6b qwen2.5-0.5b}; do
   python scripts/rewrite_traces.py --model "$M" --thinking "$T" --source "${SOURCE:-full}" --first "${FIRST:-256}" --n "${N:-4}" \
     --out "$OUT/rw_${M}_think${T}_${SOURCE:-full}_first${FIRST:-256}.parquet"
   echo "EXIT $M $?"
+  # rewrite_traces.py ends with os._exit, which can leave vLLM's EngineCore child holding the GPU; the next model then
+  # finds "No available memory for the cache blocks". Kill our leftovers and wait until the GPU memory is released.
+  pkill -u "$USER" -f 'EngineCore|rewrite_traces.py' 2>/dev/null
+  for _ in $(seq 60); do
+    [ "$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits | head -1)" -lt 1000 ] && break; sleep 5
+  done
+  nvidia-smi --query-gpu=memory.used --format=csv,noheader
 done
+for f in "$OUT"/rw_*_first${FIRST:-256}.parquet; do python scripts/inspect_rewrites.py "$f" --show 2; done
