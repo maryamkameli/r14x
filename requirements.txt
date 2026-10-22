@@ -1,0 +1,46 @@
+# R1x4 / AMPO-fork kit -- pinned stack for MSI (A100 / A40 / L40S / H100; CUDA 12.x driver), Python 3.10.
+# This is the stack the kit was tested with on MSI (README §4: "torch 2.6 / vLLM 0.8.5, the ampo env"),
+# with the extra pins setup_rtx.sh found necessary (hydra/omegaconf/antlr, tensordict, transformers for Qwen3).
+# Install order matters (see scripts/setup_msi.sh):
+#   1) pip install -r requirements.txt
+#   2) pip install flash-attn==2.7.4.post1 --no-build-isolation      (needs torch already installed)
+#   3) pip install -e verl --no-deps                                   (the kit's verl 0.5.0.dev fork)
+
+# --- engine (vllm 0.8.5 pins torch 2.6.0 + xformers + matching nvidia-* cu12 libs) ---
+vllm==0.8.5
+torch==2.6.0
+transformers==4.51.3            # Qwen3 support; vllm 0.8.5 compatible
+
+# --- verl runtime ---
+ray[default]==2.46.0
+tensordict==0.8.3               # verl: >=0.8.0,<=0.9.1,!=0.9.0
+torchdata==0.11.0
+hydra-core==1.3.2
+omegaconf==2.3.0
+antlr4-python3-runtime==4.9.3   # hydra 1.3 needs antlr 4.9.*; math-verify must use the same runtime
+accelerate
+peft
+datasets
+pyarrow>=19.0.0
+pandas
+numpy<2.0.0
+codetiming
+dill
+pybind11
+psutil
+einops
+packaging>=20.0
+# NO protobuf>=5 pin here (setup_rtx.sh has one for vLLM 0.9.2): vLLM 0.8.5 pins opentelemetry 1.26, whose
+# opentelemetry-proto needs protobuf<5 -> pinning >=5.28 makes pip backtrack until "resolution-too-deep".
+tensorboard
+wandb
+liger-kernel
+
+# --- math grader (reward v4 = math_verify on the whole response) ---
+math-verify[antlr4_9_3]==0.8.0
+latex2sympy2_extended
+pylatexenc
+sympy
+
+# --- tests ---
+pytest
