@@ -18,6 +18,7 @@ import argparse, os, shlex, subprocess, sys, time
 
 KIT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MODELS = {  # path, rollout TP, vLLM memory share, optimizer offload, token budget per GPU micro-batch, student EOS ids
+    'qwen3-0.6b': dict(path='Qwen/Qwen3-0.6B', tp=1, mem=0.45, offload=False, tok=32768, eos=[151645, 151643], tag='QWEN3-0.6B', mu='qwen3-4b', batch=96),
     'qwen3-1.7b': dict(path='Qwen/Qwen3-1.7B', tp=1, mem=0.45, offload=False, tok=32768, eos=[151645, 151643], tag='QWEN3-1.7B', mu='qwen3-4b', batch=48),
     'qwen3-4b': dict(path='Qwen/Qwen3-4B', tp=1, mem=0.45, offload=False, tok=24576, eos=[151645, 151643], tag='QWEN3-4B', mu='qwen3-32b', batch=40),
     'qwen2.5-math-7b': dict(path='Elliott/Qwen2.5-Math-7B-16k-think', tp=1, mem=0.50, offload=True, tok=18432, eos=[151643],
@@ -66,7 +67,7 @@ ap.add_argument('--mu_pool', default=None, help='default <root>/data/mu/mu_<teac
 ap.add_argument('--rank_pool', type=int, default=1000)
 ap.add_argument('--rank_top', type=int, default=100)
 ap.add_argument('--rank_score', default='sum', choices=['sum', 'min', 'pos', 'neg'])
-ap.add_argument('--batch', type=int, default=None, help='prompts per step (default: 48 for qwen3-1.7b, 40 for qwen3-4b)')
+ap.add_argument('--batch', type=int, default=None, help='prompts per step (default: 96 for qwen3-0.6b, 48 for qwen3-1.7b, 40 for qwen3-4b)')
 ap.add_argument('--lr', type=float, default=1e-6)
 ap.add_argument('--name', default=None, help='experiment name (default: descriptive, from the knobs)')
 ap.add_argument('--resume', default='auto', choices=['auto', 'disable'])
@@ -97,7 +98,7 @@ name = a.name or '-'.join(['R1X4', dset, m['tag'], f'P{a.p:g}PCT' if a.p > 0 els
                           + (['GATEALLFAIL'] if a.gate == 'all_fail' else []) + ([f'LAMBDA0{a.lambda0:g}'] if a.lambda0 != 1 else []))
 ckpt, logs = os.path.join(a.root, 'ckpt', name), os.path.join(a.root, 'logs')
 os.makedirs(logs, exist_ok=True)
-R, P, B = 8192, 1024, a.batch or m['batch']
+R, P, B = 8192, 1536, a.batch or m['batch']  # P: the longest valid.parquet prompt (olympiad_bench row 1076) is 1407 tokens; truncation=error
 assert (B * 4) % a.gpus == 0, f'--batch {B}: 4*batch rollouts must split over {a.gpus} GPUs'
 assert a.layout == 'r1x4' or (B * (4 + a.k_teacher)) % a.gpus == 0, f'--batch {B} x (4+{a.k_teacher}) rows must split over {a.gpus} GPUs'
 assert a.layout == 'r1x4' or a.anneal, '--layout append is the IS+annealing recipe: use it with --anneal yes'
@@ -117,6 +118,8 @@ ov = [
     f'actor_rollout_ref.actor.optim.lr={a.lr}', 'actor_rollout_ref.actor.optim.lr_warmup_steps=0',
     'actor_rollout_ref.actor.optim.weight_decay=0.01', 'actor_rollout_ref.actor.grad_clip=1.0',
     f'actor_rollout_ref.actor.ppo_mini_batch_size={B * 8 // 4}',  # x rollout.n(4) = all 8 rows of every group: ONE update per step
+    # use_dynamic_bsz splits by tokens; the micro size only feeds divisibility asserts after //n_gpus, so 1 per GPU divides any mini-batch
+    f'actor_rollout_ref.actor.ppo_micro_batch_size={a.gpus}',
     'actor_rollout_ref.actor.ppo_epochs=1', 'actor_rollout_ref.actor.use_dynamic_bsz=True',
     f'actor_rollout_ref.actor.ppo_max_token_len_per_gpu={m["tok"]}',
     'actor_rollout_ref.actor.use_kl_loss=False', 'actor_rollout_ref.actor.kl_loss_coef=0.0', 'algorithm.kl_ctrl.kl_coef=0.0',

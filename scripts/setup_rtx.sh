@@ -31,6 +31,9 @@ python -m pip install "transformers==4.51.3" "tensordict==0.8.3" "ray[default]==
   "hydra-core==1.3.2" "omegaconf==2.3.0" "antlr4-python3-runtime==4.9.3" codetiming pylatexenc "math-verify[antlr4_9_3]==0.8.0" latex2sympy2_extended datasets pyarrow pandas peft \
   accelerate tensorboard "protobuf>=5.28" dill pybind11 psutil einops "numpy<2.3"
 python -m pip install -e "$KIT/verl" --no-deps
+# torch 2.7.0+cu128 pulls nvidia-nccl-cu12 2.26.2, a CUDA 12.2 build: every collective on sm_120 dies with
+# "illegal memory access" (P2P/SHM transports). The .post1 rebuild (CUDA 12.8) of the same version works.
+python -m pip install --no-deps "nvidia-nccl-cu12==2.26.2.post1"
 
 python - <<'EOF'
 import torch
