@@ -64,11 +64,17 @@ def rep4(ids):
     return 1 - len(set(grams)) / len(grams) if grams else 0.0
 
 
-def leaked(text, gold):
-    """True if an EARLIER \\boxed{} (not the last one) equals the gold answer: the model had it and changed it."""
-    from verl.r1x4.reward import grade_one
-    boxes = boxed_all(text)
-    return any(grade_one('\\boxed{' + b + '}', gold) == 1 for b in boxes[:-1])
+def leaked_batch(texts, golds, workers=16):
+    """For each trace: True if an EARLIER \\boxed{} (not the last one) equals the gold answer (it had the answer and
+    changed it). Graded with grade_texts (worker processes + hard timeout): math_verify can hang in C code
+    (verl/r1x4/reward.py), so it must never be called in the main process. Timeouts (-1) count as no leak."""
+    from verl.r1x4.reward import grade_texts
+    jobs = [(k, '\\boxed{' + b + '}', g) for k, (t, g) in enumerate(zip(texts, golds)) for b in boxed_all(t)[:-1]]
+    out = [False] * len(texts)
+    if jobs:
+        for (k, _, _), v in zip(jobs, grade_texts([j[1] for j in jobs], [j[2] for j in jobs], workers=workers)):
+            out[k] = out[k] or v == 1
+    return out
 
 
 def main():
@@ -89,7 +95,7 @@ def main():
     golds = [rows[i]['reward_model']['ground_truth'] for i, _ in flat]
     grade = grade_texts([o.text for _, o in flat], golds, workers=16)
     c = dict(drawn=len(flat), correct=0, ungraded=0, wrong=0, complete=0, clean=0, no_leak=0, in_window=0, core=0)
-    negs, per_problem = [], {}
+    negs, per_problem, cand = [], {}, []
     for (i, o), g, gold in zip(flat, grade, golds):
         if g == 1:
             c['correct'] += 1
@@ -108,8 +114,12 @@ def main():
         if not fb:
             continue
         c['clean'] += 1
-        if leaked(text, gold):
+        cand.append((i, o, gold, fb))
+    leaks = leaked_batch([o.text for _, o, _, _ in cand], [g for _, _, g, _ in cand])
+    for (i, o, gold, fb), lk in zip(cand, leaks):
+        if lk:
             continue
+        text = o.text
         c['no_leak'] += 1
         n_tok = len(o.token_ids)
         win = a.win_lo * r1_tokens[i] <= n_tok <= a.win_hi * r1_tokens[i]

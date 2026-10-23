@@ -28,9 +28,9 @@ def test_boxed_all_balanced_braces():
 
 
 def test_leak_only_counts_earlier_boxes():
-    assert H['leaked'](T, '5')          # had the gold answer earlier, then changed it
-    assert not H['leaked'](T, '7')      # gold only in the final box: that is a correct answer, not a leak
-    assert not H['leaked'](T, '3')
+    got = H['leaked_batch']([T, T, T, 'no box at all'], ['5', '7', '3', '5'], workers=2)
+    # gold 5: in an earlier box, then changed -> leak; gold 7: only in the final box (a correct answer, not a leak)
+    assert got == [True, False, False, False]
 
 
 def test_rep4():
