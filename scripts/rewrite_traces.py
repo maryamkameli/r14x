@@ -29,7 +29,8 @@ rollout sampling (T=1, top_p=1, top_k=-1; --nat_sampling card for model-card val
   --cap_mode per_problem: every rewritten problem gets its own median (>= --nat_min_correct correct answers), else the
       median of similar problems (same data_source + R1-length quintile -> data_source -> all).
 Phase 2 rewrites with max_tokens = cap (longer outputs are cut and rejected) and states the budget in the prompt; a
-rewrite is kept only if correct AND n_tokens <= cap.
+rewrite is kept only if correct AND n_generated <= cap, where n_generated counts every generated token exactly like the
+natural answers (thinking on: thinking + rewrite). n_tokens = the rewrite text alone (what would be stored).
 
 Output (one row per problem, resumable): row (index into openr1.parquet), model, thinking, source, orig_tokens,
 nat_correct_tokens (lengths of natural correct answers), nat_n, cap, cap_source, n_drawn, n_correct (kept rewrites),
@@ -94,6 +95,7 @@ ap.add_argument('--nat_thinking', default='default', choices=['default', 'on', '
 ap.add_argument('--nat_sampling', default='train', choices=['train', 'card'])
 ap.add_argument('--nat_min_correct', type=int, default=2, help='own correct answers needed for a per-problem cap')
 ap.add_argument('--pick', default='longest', choices=['longest', 'shortest'], help='which kept rewrite becomes best')
+ap.add_argument('--natural', default=None, help='reuse an existing *_natural.parquet (same model + natural settings)')
 ap.add_argument('--dry_run', action='store_true')
 a = ap.parse_args()
 M = MODELS[a.model]
@@ -120,8 +122,11 @@ def render_natural(tok, prompt):
 
 def render(tok, problem, solution, cap=None):
     words = max(10, int(0.6 * cap)) if cap else 100000  # ~0.75 words/token for English+LaTeX, with margin
-    msgs = [{'role': 'system', 'content': SYSTEM},
-            {'role': 'user', 'content': USER.format(problem=problem, solution=solution, words=words)}]
+    user = USER.format(problem=problem, solution=solution, words=words)
+    if a.thinking == 'on' and cap:  # the cap covers thinking + rewrite
+        user = user.replace(f'your rewrite must be\nshorter than {words} words.',
+                            f'your thinking plus your rewrite together must be\nshorter than {words} words.')
+    msgs = [{'role': 'system', 'content': SYSTEM}, {'role': 'user', 'content': user}]
     kw = {'enable_thinking': a.thinking == 'on'} if M['family'] == 'qwen3' else {}
     return tok.apply_chat_template(msgs, add_generation_prompt=True, tokenize=False, **kw)
 
@@ -152,6 +157,8 @@ def natural_pass(llm, tok, rows, path, pa, pq, grade_texts, SamplingParams):
     sp = SamplingParams(n=a.nat_n, max_tokens=a.nat_max_tokens, **samp)
     print(f'[natural] {a.model} {len(todo)} to do, {len(done)} done, n={a.nat_n}, sampling {samp} -> {path}', flush=True)
     step = a.nat_problems if a.cap_mode == 'global' else a.chunk
+    if a.cap_mode == 'global' and sum(len(x['correct_tokens']) for x in res) >= a.nat_target:
+        todo = []  # resumed with enough correct answers already: keep the cap identical, generate nothing new
     for c in range(0, len(todo), step):
         batch = todo[c:c + step]
         gens = llm.generate([render_natural(tok, r['prompt']) for r in batch], sp, use_tqdm=False)
@@ -240,7 +247,7 @@ def main():
     out = a.out or f'rw_{a.model}_think{a.thinking}_{a.source}.parquet'
     if a.num_shards > 1:
         out = out.replace('.parquet', f'_shard{a.shard:02d}of{a.num_shards:02d}.parquet')
-    nat_path = out.replace('.parquet', '_natural.parquet')
+    nat_path = a.natural or out.replace('.parquet', '_natural.parquet')
     for r in rows:
         r['orig_tokens'] = ntok(tok, r['target'][0]['content'])
     llm = LLM(M['path'], dtype='bfloat16', gpu_memory_utilization=a.gpu_mem, enable_prefix_caching=True, seed=a.seed + a.shard,
@@ -272,9 +279,8 @@ def main():
                 continue
             keep.append(r)
             texts.append(render(tok, problem_of(r['prompt']), src, cap))
-            # thinking on: the cap applies to the rewrite (after </think>); allow room for the thinking itself
-            budget = cap + 1 if a.thinking == 'off' else min(a.max_tokens, cap + 4096)
-            sps.append(SamplingParams(n=a.n, max_tokens=budget, **samp))
+            # the cap counts ALL generated tokens, like the natural answers it comes from (thinking on: thinking + rewrite)
+            sps.append(SamplingParams(n=a.n, max_tokens=cap + 1, **samp))
         gens = llm.generate(texts, sps, use_tqdm=False)
         flat = []
         for k, g in enumerate(gens):
@@ -282,8 +288,9 @@ def main():
             for o in g.outputs:
                 th, rw = split_output(o.text)
                 n = ntok(tok, rw)
+                n_gen = len(o.token_ids)  # thinking + rewrite (+ stop), same count as the natural answers
                 flat.append((k, dict(text=rw, thinking=th, finish=o.finish_reason or '', correct=0, n_tokens=n,
-                                     within_cap=int(bool(rw) and n <= cap))))
+                                     n_generated=n_gen, within_cap=int(bool(rw) and n_gen <= cap))))
         ok = grade_texts([s['text'] for _, s in flat], [keep[k]['reward_model']['ground_truth'] for k, _ in flat], workers=16)
         per = {}
         for (k, s), v in zip(flat, ok):

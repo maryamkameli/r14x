@@ -17,7 +17,7 @@ for M in ${MODELS:-qwen3-0.6b qwen2.5-0.5b}; do
   T=${THINKING:-off}; [ "$M" = qwen2.5-0.5b ] && T=off
   # phase 1: NAT_N natural answers per problem -> per-problem length cap; phase 2: capped rewrites (see the script docstring)
   python scripts/rewrite_traces.py --model "$M" --thinking "$T" --source "${SOURCE:-full}" --first "${FIRST:-256}" --n "${N:-4}" \
-    --nat_n "${NAT_N:-4}" --nat_target "${NAT_TARGET:-50}" --out "$OUT/rw_${M}_think${T}_${SOURCE:-full}_capped_first${FIRST:-256}.parquet"
+    --nat_n "${NAT_N:-4}" --nat_target "${NAT_TARGET:-50}" ${NATURAL:+--natural "$NATURAL"} --out "$OUT/rw_${M}_think${T}_${SOURCE:-full}_capped_first${FIRST:-256}.parquet"
   echo "EXIT $M $?"
   # rewrite_traces.py ends with os._exit, which can leave vLLM's EngineCore child holding the GPU; the next model then
   # finds "No available memory for the cache blocks". Kill our leftovers and wait until the GPU memory is released.
