@@ -36,6 +36,32 @@ def error_flags(text, scope='all', max_hits=5):
     return [m.group(0).lower() for m in ERROR_FLAG.finditer(part(text, scope))][:max_hits]
 
 
+SENT_SPLIT = re.compile(r'(?<=[.!?])[ \t]+(?=[A-Z*(\\$])')  # sentence boundary inside a line
+
+
+def cut_error_flags(text):
+    """Remove every sentence that contains an error-flag phrase (Ivan 2026-10-25: cut 'wait, that's a mistake'
+    instead of dropping the trace). Works line by line; within a line, sentence by sentence; whitespace and line
+    structure are kept, emptied lines are dropped. A flagged sentence that also holds a \\boxed{} answer is NOT cut
+    (the answer would be lost): such a trace keeps its flag and is rejected later by error_flags().
+    Returns (new_text, n_sentences_cut)."""
+    out, cut = [], 0
+    for line in text.split('\n'):
+        if not ERROR_FLAG.search(line):
+            out.append(line)
+            continue
+        keep = []
+        for s in SENT_SPLIT.split(line):
+            if ERROR_FLAG.search(s) and '\\boxed' not in s:
+                cut += 1
+            else:
+                keep.append(s)
+        if keep:
+            out.append(' '.join(keep))
+    new = re.sub(r'\n{3,}', '\n\n', '\n'.join(out))
+    return new, cut
+
+
 def quality(text):
     """Dict of flags stored with every trace: cjk / error flags for the whole text and for the final part."""
     return dict(cjk_any=has_cjk(text, 'all'), cjk_final=has_cjk(text, 'final'),

@@ -1,0 +1,161 @@
+#!/usr/bin/env python3
+"""Clean rewrite pairs (cut error-flag sentences, drop CJK), re-grade, and add teacher-forced token log-probs.
+
+Input: Ivan's pairs parquet (pairs_right_wrong_*.parquet: luffy_index, visit, data_source, prompt, ground_truth,
+right_text, wrong_text, ...). For each problem and each of right_text / wrong_text:
+  1. cut every sentence with an error-flag phrase, thinking included (trace_filters.cut_error_flags; Ivan 2026-10-25)
+  2. reject the text if it still has a flag (e.g. next to the \\boxed answer) or any CJK character
+  3. re-grade with the trainer's grader: right must stay correct (1), wrong must stay wrong (0)
+  4. teacher-force the final text under the TRAINING prompt with the generating model (--model) and store the log-prob
+     of every response token. Tokenization = R1x4Data.teacher_ids (verl/r1x4/trainer.py): the stored text (with the
+     '<think>\\n\\n</think>\\n\\n' prefix of Qwen3's non-thinking template, as build_rewrite_pairs.py stores it), minus
+     '<think>\\n' when the prompt already ends with it, + EOS, cut at --max_response_length; the prompt is the dataset
+     chat with the model's default chat template. The log-probs therefore line up 1:1 with the trainer's response tokens.
+     Computed by vLLM prompt_logprobs (logprob of each given token; no sampling), bf16.
+A problem is kept only if BOTH its right and its wrong text survive.
+
+Output parquet (R1x4 row format of data/build_rewrite_pairs.py + log-probs), sorted by visit:
+  data_source, prompt, reward_model, correct_text, wrong_texts=[w], wrong_meta, luffy_index, visit,
+  correct_token_ids, correct_token_logps, wrong_token_ids, wrong_token_logps   (lists of lists for wrong_*)
+<out>_stats.json: counts per step.
+
+  python scripts/clean_and_score.py --pairs pairs_right_wrong_qwen3-0.6b_26904.parquet --out rw_pairs_clean_lp.parquet
+  python scripts/clean_and_score.py --pairs ... --first 64 --out /tmp/t.parquet      # quick check
+"""
+import argparse, collections, json, os, sys
+
+# vLLM's engine process must be spawned, not forked: the grader's worker processes (fork) run in this process too
+os.environ.setdefault('VLLM_WORKER_MULTIPROC_METHOD', 'spawn')
+KIT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(KIT, 'verl'))
+sys.path.insert(0, os.path.join(KIT, 'scripts'))
+from trace_filters import cut_error_flags, error_flags, has_cjk  # noqa: E402
+
+EMPTY_THINK = '<think>\n\n</think>\n\n'
+ap = argparse.ArgumentParser(allow_abbrev=False, description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+ap.add_argument('--pairs', required=True)
+ap.add_argument('--model', default='Qwen/Qwen3-0.6B', help='the model that generated the texts (log-probs under it)')
+ap.add_argument('--first', type=int, default=0)
+ap.add_argument('--max_response_length', type=int, default=8192)
+ap.add_argument('--max_prompt_length', type=int, default=1536)
+ap.add_argument('--no_logprobs', action='store_true')
+ap.add_argument('--chunk', type=int, default=256, help='sequences per generate() call')
+ap.add_argument('--gpu_mem', type=float, default=0.5, help='vLLM share (rest is needed for prompt_logprobs tensors)')
+ap.add_argument('--step_tokens', type=int, default=2048, help='max tokens per engine step (bounds logprob memory)')
+ap.add_argument('--out', required=True)
+a = ap.parse_args()
+
+
+def response_ids(tok, prompt_text, text, eos):
+    """= R1x4Data.teacher_ids."""
+    if prompt_text.endswith('<think>\n') and text.startswith('<think>\n'):
+        text = text[len('<think>\n'):]
+    return (tok(text, add_special_tokens=False)['input_ids'] + [eos])[:a.max_response_length]
+
+
+def clean(text):
+    """-> (cleaned text or None if rejected, reason, n_cut). Text is stored without the empty think prefix here."""
+    new, n = cut_error_flags(text)
+    if error_flags(new):
+        return None, 'flag_kept', n
+    if has_cjk(new):
+        return None, 'cjk', n
+    return new, 'ok', n
+
+
+def main():
+    import pyarrow as pa, pyarrow.parquet as pq
+    from transformers import AutoTokenizer
+    from verl.r1x4.reward import grade_texts
+    # start vLLM BEFORE the grader forks its workers (same order as gen_negatives.py / rewrite_traces.py)
+    llm = None
+    if not a.no_logprobs:
+        from vllm import LLM
+        # prompt_logprobs materializes a full-vocab (~152k) float32 log-softmax per scheduled token: with the default
+        # 8,192-token step that is ~5 GB + copies and OOMed a 44 GB L40S at gpu_mem 0.85 (job 4702867). Small steps and
+        # a smaller KV-cache share leave room for it.
+        llm = LLM(a.model, dtype='bfloat16', gpu_memory_utilization=a.gpu_mem, enable_prefix_caching=False,
+                  max_model_len=a.max_prompt_length + a.max_response_length + 8,
+                  max_num_batched_tokens=a.step_tokens, enable_chunked_prefill=True)
+    t = pq.read_table(a.pairs).to_pylist()
+    t = t[:a.first] if a.first > 0 else t
+    c = collections.Counter(problems=len(t))
+    cand = []  # (row, right_clean, wrong_clean, n_cut_right, n_cut_wrong)
+    for r in t:
+        rc, rwhy, rn = clean(r['right_text'])
+        wc, wwhy, wn = clean(r['wrong_text'])
+        c[f'right_{rwhy}'] += 1
+        c[f'wrong_{wwhy}'] += 1
+        c['right_sentences_cut'] += rn
+        c['wrong_sentences_cut'] += wn
+        c['right_texts_with_cut'] += rn > 0
+        c['wrong_texts_with_cut'] += wn > 0
+        if rc is not None and wc is not None:
+            cand.append((r, rc, wc, rn, wn))
+    c['after_text_filters'] = len(cand)
+    # re-grade (the cut must not change the label): right stays 1, wrong stays 0 (-1 ungraded = reject)
+    texts = [x for _, rc, wc, _, _ in cand for x in (rc, wc)]
+    golds = [r['ground_truth'] for r, *_ in cand for _ in (0, 1)]
+    g = grade_texts(texts, golds, workers=16)
+    keep = []
+    for k, x in enumerate(cand):
+        gr, gw = g[2 * k], g[2 * k + 1]
+        c['regrade_right_not_correct'] += gr != 1
+        c['regrade_wrong_not_wrong'] += gw != 0
+        if gr == 1 and gw == 0:
+            keep.append(x)
+    c['after_regrade'] = len(keep)
+    print(json.dumps(dict(c)), flush=True)
+
+    tok = AutoTokenizer.from_pretrained(a.model)
+    eos = tok.convert_tokens_to_ids('<|im_end|>')
+    rows = []
+    for r, rc, wc, rn, wn in keep:
+        rows.append({'data_source': r['data_source'], 'prompt': r['prompt'],
+                     'reward_model': {'ground_truth': r['ground_truth'], 'style': 'rule'},
+                     'correct_text': EMPTY_THINK + rc, 'wrong_texts': [EMPTY_THINK + wc],
+                     'wrong_meta': [json.dumps({'model': a.model, 'kind': 'rewrite_' + r.get('wrong_task', 'wrong'),
+                                                'sentences_cut': wn})],
+                     'luffy_index': r['luffy_index'], 'visit': r['visit'], 'correct_sentences_cut': rn})
+    if llm is not None:
+        add_logprobs(llm, rows, tok, eos, c)
+    rows.sort(key=lambda r: r['visit'])
+    pq.write_table(pa.Table.from_pylist(rows), a.out, compression='zstd', row_group_size=1000)
+    c['written'] = len(rows)
+    json.dump(dict(c), open(a.out.replace('.parquet', '') + '_stats.json', 'w'), indent=1)
+    print(json.dumps(dict(c)), flush=True)
+    print('CLEAN_DONE', flush=True)
+    os._exit(0)
+
+
+def add_logprobs(llm, rows, tok, eos, c):
+    """Teacher-forced log-prob of every response token under the training prompt (vLLM prompt_logprobs)."""
+    import statistics as st
+    from vllm import SamplingParams, TokensPrompt
+    sp = SamplingParams(max_tokens=1, prompt_logprobs=0, temperature=1.0)
+    jobs = []  # (row, field, prompt_ids, resp_ids)
+    for r in rows:
+        ptext = tok.apply_chat_template(r['prompt'], add_generation_prompt=True, tokenize=False)
+        pids = tok(ptext, add_special_tokens=False)['input_ids']
+        jobs.append((r, 'correct', pids, response_ids(tok, ptext, r['correct_text'], eos)))
+        jobs.append((r, 'wrong', pids, response_ids(tok, ptext, r['wrong_texts'][0], eos)))
+    for s in range(0, len(jobs), a.chunk):
+        part = jobs[s:s + a.chunk]
+        outs = llm.generate([TokensPrompt(prompt_token_ids=p + q) for _, _, p, q in part], sp, use_tqdm=False)
+        for (r, f, p, q), o in zip(part, outs):
+            plp = o.prompt_logprobs  # list aligned with prompt tokens; entry k = {token_id: Logprob} for token k
+            lps = [float(plp[len(p) + j][tid].logprob) for j, tid in enumerate(q)]
+            if f == 'correct':
+                r['correct_token_ids'], r['correct_token_logps'] = q, lps
+            else:
+                r['wrong_token_ids'], r['wrong_token_logps'] = [q], [lps]
+        print(f'  logprobs {min(s + a.chunk, len(jobs))}/{len(jobs)}', flush=True)
+    for f in ('correct', 'wrong'):
+        m = [st.mean(r[f'{f}_token_logps'] if f == 'correct' else r[f'{f}_token_logps'][0]) for r in rows]
+        c[f'{f}_mean_token_logp_median'] = round(st.median(m), 4) if m else None
+    c['responses_cut_at_max_len'] = sum(len(r['correct_token_ids']) >= a.max_response_length for r in rows)
+
+
+if __name__ == '__main__':
+    main()
+
