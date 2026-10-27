@@ -586,14 +586,14 @@ class R1x4Trainer(MIXRayDAPOTrainer):
                 batch.batch['teacher_logp'], batch.batch['teacher_mu_mask'] = tl, tm & rmask.bool()
             if teacher_on and float(self.config.actor_rollout_ref.actor.get('teacher_token_min_teacher_prob', 0.0)) > 0:
                 # generating-teacher log-prob per wrong-teacher token (clean_and_score.py wrong_teacher_logps, aligned with
-                # teacher_ids); 0 elsewhere = p 1, never dropped by the loss
+                # teacher_ids; -inf = outside the generator's sampling support, stored as -1e4); 0 elsewhere = p 1, never dropped
                 assert 'wrong_teacher_logps' in self.data.rows[rows[0]], '--p_teacher needs wrong_teacher_logps in --data'
                 tg = torch.zeros(len(batch), R)
                 for q, lps in enumerate(t_gen):
                     if lps is not None:
                         row, n = (q // T) * G + q % T, min(len(lps), R)
-                        tg[row, :n] = torch.tensor(lps[:n])
-                batch.batch['teacher_gen_logp'] = tg * rmask.float()
+                        tg[row, :n] = torch.tensor(lps[:n]).clamp(min=-1e4)
+                batch.batch['teacher_gen_logp'] = torch.where(rmask.bool(), tg, torch.zeros_like(tg))
             batch.non_tensor_batch['uid'] = np.array([str(i) for i in rows for _ in range(G)], dtype=object)
             batch.meta_info['global_token_num'] = batch.batch['attention_mask'].sum(-1).tolist()
             # ---- pre-update policy log-probs (p filter uses them; on-policy ratio baseline)
