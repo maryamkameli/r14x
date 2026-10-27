@@ -20,16 +20,20 @@ tok = AutoTokenizer.from_pretrained(sys.argv[2] if len(sys.argv) > 2 else 'Qwen/
 eos = tok.convert_tokens_to_ids('<|im_end|>')
 data = R1x4Data(path, tok, 1536, 8192, eos)  # the trainer's loader (asserts visit order)
 bad = {'ids_mismatch': 0, 'len_mismatch': 0, 'logp_invalid': 0, 'no_eos_end': 0, 'flag_left': 0, 'cjk_left': 0,
-       'empty_think_left': 0}
+       'empty_think_left': 0, 'teacher_logp_len_mismatch': 0, 'teacher_logp_invalid': 0}
 for i, r in enumerate(data.rows):
-    for text, ids, lps in [(r['correct_text'], r['correct_token_ids'], r['correct_token_logps']),
-                           (r['wrong_texts'][0], r['wrong_token_ids'][0], r['wrong_token_logps'][0])]:
+    if 'wrong_teacher_logps' in r:
+        tl = r['wrong_teacher_logps'][0]
+        bad['teacher_logp_len_mismatch'] += len(tl) != len(r['wrong_token_ids'][0])
+        bad['teacher_logp_invalid'] += any((not math.isfinite(x)) or x > 1e-6 for x in tl)
+    for text, ids, lps, wrong in [(r['correct_text'], r['correct_token_ids'], r['correct_token_logps'], False),
+                                  (r['wrong_texts'][0], r['wrong_token_ids'][0], r['wrong_token_logps'][0], True)]:
         ref = data.teacher_ids(i, text).tolist()
         bad['ids_mismatch'] += ids != ref
         bad['len_mismatch'] += len(ids) != len(lps)
         bad['logp_invalid'] += any((not math.isfinite(x)) or x > 1e-6 for x in lps)
         bad['no_eos_end'] += ids[-1] != eos and len(ids) < 8192
-        bad['flag_left'] += bool(error_flags(text))
+        bad['flag_left'] += wrong and bool(error_flags(text))  # correct texts keep self-corrections (Ivan 2026-10-27)
         bad['cjk_left'] += has_cjk(text)
         bad['empty_think_left'] += bool(re.match(r'\s*<think>\s*</think>', text))
 print(f'{path}: {len(data.rows)} rows, visits {data.rows[0]["visit"]}..{data.rows[-1]["visit"]}')

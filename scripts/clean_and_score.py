@@ -3,8 +3,9 @@
 
 Input: Ivan's pairs parquet (pairs_right_wrong_*.parquet: luffy_index, visit, data_source, prompt, ground_truth,
 right_text, wrong_text, ...). For each problem and each of right_text / wrong_text:
-  1. cut every sentence with an error-flag phrase, thinking included (trace_filters.cut_error_flags; Ivan 2026-10-25)
-  2. reject the text if it still has a flag (e.g. next to the \\boxed answer) or any CJK character
+  1. wrong_text only: cut every sentence with an error-flag phrase, thinking included (trace_filters.cut_error_flags;
+     Ivan 2026-10-25). right_text keeps its self-corrections (Ivan 2026-10-27): nothing is cut from it
+  2. reject the text if it still has a flag (wrong_text only, e.g. next to the \\boxed answer) or any CJK character
   3. re-grade with the trainer's grader: right must stay correct (1), wrong must stay wrong (0)
   4. teacher-force the final text under the TRAINING prompt with the generating model (--model) and store the log-prob
      of every response token. Tokenization = R1x4Data.teacher_ids (verl/r1x4/trainer.py): the stored text (an empty
@@ -12,17 +13,22 @@ right_text, wrong_text, ...). For each problem and each of right_text / wrong_te
      '<think>\\n' when the prompt already ends with it, + EOS, cut at --max_response_length; the prompt is the dataset
      chat with the model's default chat template. The log-probs therefore line up 1:1 with the trainer's response tokens.
      Computed by vLLM prompt_logprobs (logprob of each given token; no sampling), bf16.
+  5. wrong_text only: the same response tokens teacher-forced under the GENERATION prompt (Ivan 2026-10-27: negative
+     teacher tokens unlikely under the teacher are dropped in training). The prompt is rebuilt exactly as
+     rewrite_traces.py built it (problem + reference from --source, the task's instruction, --words limit, Qwen3 chat
+     template with enable_thinking=False, i.e. ending in the empty think block). Raw model log-probs (T=1, no top-p/k).
+     Check: the generator sampled with top_k=20, so on uncut wrong texts the teacher rank of almost every token is <= 20.
 A problem is kept only if BOTH its right and its wrong text survive.
 
 Output parquet (R1x4 row format of data/build_rewrite_pairs.py + log-probs), sorted by visit:
   data_source, prompt, reward_model, correct_text, wrong_texts=[w], wrong_meta, luffy_index, visit,
-  correct_token_ids, correct_token_logps, wrong_token_ids, wrong_token_logps   (lists of lists for wrong_*)
+  correct_token_ids, correct_token_logps, wrong_token_ids, wrong_token_logps, wrong_teacher_logps   (lists of lists for wrong_*)
 <out>_stats.json: counts per step.
 
   python scripts/clean_and_score.py --pairs pairs_right_wrong_qwen3-0.6b_26904.parquet --out rw_pairs_clean_lp.parquet
   python scripts/clean_and_score.py --pairs ... --first 64 --out /tmp/t.parquet      # quick check
 """
-import argparse, collections, json, os, re, sys
+import argparse, collections, json, math, os, re, sys
 
 # vLLM's engine process must be spawned, not forked: the grader's worker processes (fork) run in this process too
 os.environ.setdefault('VLLM_WORKER_MULTIPROC_METHOD', 'spawn')
@@ -49,6 +55,8 @@ ap.add_argument('--no_logprobs', action='store_true')
 ap.add_argument('--chunk', type=int, default=256, help='sequences per generate() call')
 ap.add_argument('--gpu_mem', type=float, default=0.5, help='vLLM share (rest is needed for prompt_logprobs tensors)')
 ap.add_argument('--step_tokens', type=int, default=2048, help='max tokens per engine step (bounds logprob memory)')
+ap.add_argument('--source', default=None, help='extended.parquet the rewrites were made from (for wrong_teacher_logps)')
+ap.add_argument('--words', type=int, default=2000, help="rewrite_traces.py --words used for the pairs")
 ap.add_argument('--out', required=True)
 a = ap.parse_args()
 
@@ -60,9 +68,51 @@ def response_ids(tok, prompt_text, text, eos):
     return (tok(text, add_special_tokens=False)['input_ids'] + [eos])[:a.max_response_length]
 
 
-def clean(text):
-    """-> (cleaned text or None if rejected, reason, n_cut). Empty think block removed, no prefix added."""
+# --- generation prompt of the wrong rewrites: copied from the kit's scripts/rewrite_traces.py (same text, same logic)
+STYLE = 'Rewrite this solution in your own words, the way you would naturally solve the problem yourself'
+GEN_TASK = {
+    'wrong_ref': STYLE + '. Follow the reasoning of the reference solution and keep its final answer.',
+    'wrong_cut': ('The reference solution is unfinished. Solve the problem in your own words, the way you would '
+                  'naturally do it, using the start of the reference, but make one plausible mistake so that your '
+                  'final answer is {target}. Do not mention the mistake and do not say that the answer is wrong.'),
+    'wrong_free': STYLE + (', but make one plausible mistake along the way so that your final answer is NOT {gold}. '
+                           'Do not mention the mistake and do not say that the answer is wrong.'),
+}
+
+
+def last_boxed(s):
+    i = s.rfind('\\boxed{')
+    if i < 0:
+        return None
+    j, depth = i + 7, 1
+    while j < len(s) and depth:
+        depth += {'{': 1, '}': -1}.get(s[j], 0)
+        j += 1
+    return s[i + 7:j - 1].strip() if depth == 0 else None
+
+
+def gen_message(src, task):
+    """= rewrite_traces.message(r, task) for a row of the source parquet."""
+    problem = next(m['content'] for m in reversed(src['prompt']) if m['role'] == 'user')
+    gold, ref = src['reward_model']['ground_truth'], src['correct_text']
+    target = next((b for b in map(last_boxed, src['wrong_texts']) if b and b != gold.strip()), None)
+    if task == 'wrong_cut' and target is None:
+        task = 'wrong_free'
+    if task == 'wrong_ref':
+        ref = next((w for w in src['wrong_texts'] if last_boxed(w) == target), src['wrong_texts'][0])
+    if task == 'wrong_cut':
+        ref = ref[:len(ref) // 2]
+    return (f'Problem:\n{problem}\n\nReference solution (written by another model):\n{ref}\n\n---\n\n'
+            + GEN_TASK[task].format(gold=gold, target=target)
+            + f' Put your final answer within \\boxed{{}}. Your whole response must be at most {a.words} words.')
+
+
+def clean(text, cut=True):
+    """-> (cleaned text or None if rejected, reason, n_cut). Empty think block removed, no prefix added.
+    cut=False (correct texts): no error-flag sentence is cut or rejected, only the CJK check applies."""
     text, _ = strip_empty_think(text)
+    if not cut:
+        return (None, 'cjk', 0) if has_cjk(text) else (text, 'ok', 0)
     new, n = cut_error_flags(text)
     if error_flags(new):
         return None, 'flag_kept', n
@@ -83,14 +133,14 @@ def main():
         # 8,192-token step that is ~5 GB + copies and OOMed a 44 GB L40S at gpu_mem 0.85 (job 4702867). Small steps and
         # a smaller KV-cache share leave room for it.
         llm = LLM(a.model, dtype='bfloat16', gpu_memory_utilization=a.gpu_mem, enable_prefix_caching=False,
-                  max_model_len=a.max_prompt_length + a.max_response_length + 8,
+                  max_model_len=40960 if a.source else a.max_prompt_length + a.max_response_length + 8,  # Qwen3 max
                   max_num_batched_tokens=a.step_tokens, enable_chunked_prefill=True)
     t = pq.read_table(a.pairs).to_pylist()
     t = t[:a.first] if a.first > 0 else t
     c = collections.Counter(problems=len(t))
     cand = []  # (row, right_clean, wrong_clean, n_cut_right, n_cut_wrong)
     for r in t:
-        rc, rwhy, rn = clean(r['right_text'])
+        rc, rwhy, rn = clean(r['right_text'], cut=False)
         wc, wwhy, wn = clean(r['wrong_text'])
         c[f'right_{rwhy}'] += 1
         c[f'wrong_{wwhy}'] += 1
@@ -124,9 +174,14 @@ def main():
                      'correct_text': rc, 'wrong_texts': [wc],
                      'wrong_meta': [json.dumps({'model': a.model, 'kind': 'rewrite_' + r.get('wrong_task', 'wrong'),
                                                 'sentences_cut': wn})],
-                     'luffy_index': r['luffy_index'], 'visit': r['visit'], 'correct_sentences_cut': rn})
+                     'luffy_index': r['luffy_index'], 'visit': r['visit'], 'correct_sentences_cut': rn,
+                     '_wrong_task': r.get('wrong_task', 'wrong_ref')})
     if llm is not None:
         add_logprobs(llm, rows, tok, eos, c)
+        if a.source:
+            add_teacher_logprobs(llm, rows, tok, c)
+    for r in rows:
+        r.pop('_wrong_task')
     rows.sort(key=lambda r: r['visit'])
     pq.write_table(pa.Table.from_pylist(rows), a.out, compression='zstd', row_group_size=1000)
     c['written'] = len(rows)
@@ -162,6 +217,46 @@ def add_logprobs(llm, rows, tok, eos, c):
         m = [st.mean(r[f'{f}_token_logps'] if f == 'correct' else r[f'{f}_token_logps'][0]) for r in rows]
         c[f'{f}_mean_token_logp_median'] = round(st.median(m), 4) if m else None
     c['responses_cut_at_max_len'] = sum(len(r['correct_token_ids']) >= a.max_response_length for r in rows)
+
+
+def add_teacher_logprobs(llm, rows, tok, c):
+    """wrong_teacher_logps: log-prob of each stored wrong response token (wrong_token_ids, the trainer's tokens) under
+    the generation prompt. Stats: share of tokens with teacher p < 1 % and with teacher rank > 20 (top_k of the sampler)."""
+    import pyarrow.parquet as pq
+    from vllm import SamplingParams, TokensPrompt
+    need = {r['luffy_index'] for r in rows}
+    src = {}
+    pf = pq.ParquetFile(a.source)
+    for g in range(pf.metadata.num_row_groups):
+        for s in pf.read_row_group(g, columns=['luffy_index', 'prompt', 'reward_model', 'correct_text', 'wrong_texts']).to_pylist():
+            if s['luffy_index'] in need:
+                src[s['luffy_index']] = s
+    assert len(src) == len(need), f'{len(need) - len(src)} problems missing from --source'
+    sp = SamplingParams(max_tokens=1, prompt_logprobs=0, temperature=1.0)
+    jobs = []
+    for r in rows:
+        ptext = tok.apply_chat_template([{'role': 'user', 'content': gen_message(src[r['luffy_index']], r['_wrong_task'])}],
+                                        add_generation_prompt=True, tokenize=False, enable_thinking=False)
+        jobs.append((r, tok(ptext, add_special_tokens=False)['input_ids'], r['wrong_token_ids'][0]))
+    n = low = rank_hi = n_uncut = rank_hi_uncut = 0
+    for s in range(0, len(jobs), a.chunk):
+        part = jobs[s:s + a.chunk]
+        outs = llm.generate([TokensPrompt(prompt_token_ids=p + q) for _, p, q in part], sp, use_tqdm=False)
+        for (r, p, q), o in zip(part, outs):
+            ent = [o.prompt_logprobs[len(p) + j][tid] for j, tid in enumerate(q)]
+            r['wrong_teacher_logps'] = [[float(e.logprob) for e in ent]]
+            hi = sum(e.rank > 20 for e in ent[:-1])  # the EOS is the template's <|im_end|>, not a sampled token
+            n += len(ent)
+            low += sum(e.logprob < math.log(0.01) for e in ent)
+            rank_hi += hi
+            if json.loads(r['wrong_meta'][0])['sentences_cut'] == 0:
+                n_uncut += len(ent) - 1
+                rank_hi_uncut += hi
+        print(f'  teacher logprobs {min(s + a.chunk, len(jobs))}/{len(jobs)}', flush=True)
+    c['wrong_teacher_tokens'] = n
+    c['wrong_teacher_p_below_1pct_frac'] = round(low / max(n, 1), 5)
+    c['wrong_teacher_rank_gt20_frac'] = round(rank_hi / max(n, 1), 5)
+    c['wrong_teacher_rank_gt20_frac_uncut_texts'] = round(rank_hi_uncut / max(n_uncut, 1), 5)
 
 
 if __name__ == '__main__':
