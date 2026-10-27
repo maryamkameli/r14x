@@ -16,8 +16,11 @@ right_text, wrong_text, ...). For each problem and each of right_text / wrong_te
   5. wrong_text only: the same response tokens teacher-forced under the GENERATION prompt (Ivan 2026-10-27: negative
      teacher tokens unlikely under the teacher are dropped in training). The prompt is rebuilt exactly as
      rewrite_traces.py built it (problem + reference from --source, the task's instruction, --words limit, Qwen3 chat
-     template with enable_thinking=False, i.e. ending in the empty think block). Raw model log-probs (T=1, no top-p/k).
-     Check: the generator sampled with top_k=20, so on uncut wrong texts the teacher rank of almost every token is <= 20.
+     template with enable_thinking=False, i.e. ending in the empty think block). The log-prob is under the SAMPLING
+     distribution of the generator (Ivan 2026-10-27; --gen_temperature/--gen_top_k/--gen_top_p = rewrite_traces.py's
+     0.7 / 20 / 0.8), rebuilt like vLLM's sampler from the top-20 raw log-probs: logits / T, top-k, then top-p on the
+     renormalised top-k, renormalised again; a token outside that support gets -inf.
+     Check: every sampled token is inside the support, so on uncut wrong texts no token should be at -inf.
 A problem is kept only if BOTH its right and its wrong text survive.
 
 Output parquet (R1x4 row format of data/build_rewrite_pairs.py + log-probs), sorted by visit:
@@ -57,6 +60,11 @@ ap.add_argument('--gpu_mem', type=float, default=0.5, help='vLLM share (rest is 
 ap.add_argument('--step_tokens', type=int, default=2048, help='max tokens per engine step (bounds logprob memory)')
 ap.add_argument('--source', default=None, help='extended.parquet the rewrites were made from (for wrong_teacher_logps)')
 ap.add_argument('--words', type=int, default=2000, help="rewrite_traces.py --words used for the pairs")
+ap.add_argument('--gen_temperature', type=float, default=0.7, help='sampling params of the rewrites (rewrite_traces.py)')
+ap.add_argument('--gen_top_k', type=int, default=20)
+ap.add_argument('--gen_top_p', type=float, default=0.8)
+ap.add_argument('--teacher_chunk', type=int, default=32, help='sequences per generate() for the teacher log-probs '
+                '(long prompts x top-20 log-prob objects use a lot of host memory)')
 ap.add_argument('--out', required=True)
 a = ap.parse_args()
 
@@ -219,9 +227,31 @@ def add_logprobs(llm, rows, tok, eos, c):
     c['responses_cut_at_max_len'] = sum(len(r['correct_token_ids']) >= a.max_response_length for r in rows)
 
 
+def sampling_logprob(top, y):
+    """log-prob of token y under vLLM's sampler (temperature -> top-k -> top-p on the renormalised top-k), from the raw
+    log-probs `top` {token: logprob} of the k most likely tokens (y may be missing = outside top-k). -inf = outside."""
+    if y not in top:
+        return -math.inf
+    s = sorted(((lp / a.gen_temperature, t) for t, lp in top.items()), reverse=True)[:a.gen_top_k]
+    m = s[0][0]
+    w = [math.exp(x - m) for x, _ in s]
+    z = sum(w)
+    q = [x / z for x in w]
+    # vLLM: ascending cumsum; drop a token when the mass of it and all less likely ones is <= 1 - top_p (keep the top one)
+    keep, tail = [], 0.0
+    for qi in reversed(q):
+        tail += qi
+        keep.append(tail > 1 - a.gen_top_p)
+    keep = keep[::-1]
+    keep[0] = True
+    kept = {t: qi for (_, t), qi, k in zip(s, q, keep) if k}
+    return math.log(kept[y] / sum(kept.values())) if y in kept else -math.inf
+
+
 def add_teacher_logprobs(llm, rows, tok, c):
     """wrong_teacher_logps: log-prob of each stored wrong response token (wrong_token_ids, the trainer's tokens) under
-    the generation prompt. Stats: share of tokens with teacher p < 1 % and with teacher rank > 20 (top_k of the sampler)."""
+    the generator's sampling distribution given the generation prompt (sampling_logprob). Stats: share of tokens below
+    1 % and outside the support (-inf), and the raw (T=1) share below 1 % for comparison."""
     import pyarrow.parquet as pq
     from vllm import SamplingParams, TokensPrompt
     need = {r['luffy_index'] for r in rows}
@@ -232,33 +262,39 @@ def add_teacher_logprobs(llm, rows, tok, c):
             if s['luffy_index'] in need:
                 src[s['luffy_index']] = s
     assert len(src) == len(need), f'{len(need) - len(src)} problems missing from --source'
-    sp = SamplingParams(max_tokens=1, prompt_logprobs=0, temperature=1.0)
+    sp = SamplingParams(max_tokens=1, prompt_logprobs=a.gen_top_k, temperature=1.0)
     jobs = []
     for r in rows:
         ptext = tok.apply_chat_template([{'role': 'user', 'content': gen_message(src[r['luffy_index']], r['_wrong_task'])}],
                                         add_generation_prompt=True, tokenize=False, enable_thinking=False)
         jobs.append((r, tok(ptext, add_special_tokens=False)['input_ids'], r['wrong_token_ids'][0]))
-    n = low = rank_hi = n_uncut = rank_hi_uncut = 0
-    for s in range(0, len(jobs), a.chunk):
-        part = jobs[s:s + a.chunk]
+    n = low = out = raw_low = n_uncut = out_uncut = 0
+    for s in range(0, len(jobs), a.teacher_chunk):
+        part = jobs[s:s + a.teacher_chunk]
         outs = llm.generate([TokensPrompt(prompt_token_ids=p + q) for _, p, q in part], sp, use_tqdm=False)
         for (r, p, q), o in zip(part, outs):
-            ent = [o.prompt_logprobs[len(p) + j][tid] for j, tid in enumerate(q)]
-            r['wrong_teacher_logps'] = [[float(e.logprob) for e in ent]]
-            hi = sum(e.rank > 20 for e in ent[:-1])  # the EOS is the template's <|im_end|>, not a sampled token
-            n += len(ent)
-            low += sum(e.logprob < math.log(0.01) for e in ent)
-            rank_hi += hi
+            lps = []
+            for j, y in enumerate(q):
+                ent = o.prompt_logprobs[len(p) + j]
+                top = {t: float(e.logprob) for t, e in ent.items() if e.rank <= a.gen_top_k}
+                lps.append(sampling_logprob(top, y))
+                raw_low += ent[y].logprob < math.log(0.01)
+            r['wrong_teacher_logps'] = [lps]
+            o_n = sum(x == -math.inf for x in lps)
+            n += len(lps)
+            low += sum(x < math.log(0.01) for x in lps)
+            out += o_n
             if json.loads(r['wrong_meta'][0])['sentences_cut'] == 0:
-                n_uncut += len(ent) - 1
-                rank_hi_uncut += hi
-        print(f'  teacher logprobs {min(s + a.chunk, len(jobs))}/{len(jobs)}', flush=True)
+                n_uncut += len(lps)
+                out_uncut += o_n
+        del outs
+        print(f'  teacher logprobs {min(s + a.teacher_chunk, len(jobs))}/{len(jobs)}', flush=True)
     c['wrong_teacher_tokens'] = n
-    c['wrong_teacher_p_below_1pct_frac'] = round(low / max(n, 1), 5)
-    c['wrong_teacher_rank_gt20_frac'] = round(rank_hi / max(n, 1), 5)
-    c['wrong_teacher_rank_gt20_frac_uncut_texts'] = round(rank_hi_uncut / max(n_uncut, 1), 5)
+    c['wrong_teacher_p_below_1pct_frac'] = round(low / max(n, 1), 6)
+    c['wrong_teacher_outside_support_frac'] = round(out / max(n, 1), 6)
+    c['wrong_teacher_outside_support_frac_uncut_texts'] = round(out_uncut / max(n_uncut, 1), 6)
+    c['wrong_teacher_raw_T1_p_below_1pct_frac'] = round(raw_low / max(n, 1), 6)
 
 
 if __name__ == '__main__':
     main()
-

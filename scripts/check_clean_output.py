@@ -25,7 +25,7 @@ for i, r in enumerate(data.rows):
     if 'wrong_teacher_logps' in r:
         tl = r['wrong_teacher_logps'][0]
         bad['teacher_logp_len_mismatch'] += len(tl) != len(r['wrong_token_ids'][0])
-        bad['teacher_logp_invalid'] += any((not math.isfinite(x)) or x > 1e-6 for x in tl)
+        bad['teacher_logp_invalid'] += any(math.isnan(x) or x > 1e-6 for x in tl)  # -inf = outside the sampling support
     for text, ids, lps, wrong in [(r['correct_text'], r['correct_token_ids'], r['correct_token_logps'], False),
                                   (r['wrong_texts'][0], r['wrong_token_ids'][0], r['wrong_token_logps'][0], True)]:
         ref = data.teacher_ids(i, text).tolist()
