@@ -187,8 +187,9 @@ r1x4:  # used only by verl.r1x4.main_r1x4
     pool: 1000                    # next prompts in LUFFY visit order that are teacher-forced
     top: 100                      # most likely ones trained, in decreasing likelihood
     max_neg: 4                    # wrong traces per prompt scored
-    score: sum                    # sum | min | pos | neg of the mean token log-likelihoods of pos and best neg
+    score: sum                    # sum | min | pos | neg of the mean token log-likelihoods of pos and best neg | gold = mean prob of the gold answer after the correct trace (AMPO-style)
     chunk: 512                    # rows per compute_log_prob call
+    rolling: False                # True: rolling pool (unpicked rows stay and age, pool topped up to `pool` each round)
   ches:
     enable: False
     drop_frac: 0.5                # fraction of each negative row's response tokens dropped (highest score)
@@ -214,4 +215,41 @@ r1x4:  # used only by verl.r1x4.main_r1x4
     cbar: 1.0
     logratio_min: -20.0
     mu_pool: null                 # parquet(s) from scripts/gen_teacher_mu.py (comma list / globs)
+  rlplus:                         # RL-PLUS multiple importance sampling on teacher tokens (arXiv 2508.00222 eq. 4, Thm 3.2)
+    enable: False
+    warmup_steps: 10              # steps 1..warmup: ratio pi/pi_old (= 1, no IS); later: pi / (0.75 pi_old + 0.25/V)
+    cbar: 1.0                     # clip of the ratio (the loss uses actor.is_cbar; keep both equal)
+  mc_skip:                        # skip prompts at GRPO's fixed point (solved), checked with extra Monte Carlo samples
+    enable: False
+    samples: 4                    # extra rollouts per candidate prompt (graded only, never trained)
+    z: 1.0                        # skip iff 1 - p_hat <= z * se(p_hat) over the 4 students + MC samples
+  logra:                          # LoGRA low-rank gradient sketches + predicted-KL step control (arXiv 2610.06647)
+    enable: False                 # needs actor_rollout_ref.actor.fsdp_config.use_orig_params=True
+    rank: 256
+    refresh: True                 # new random projection every step
+    dist: rademacher
+    optimizer: rowadam            # rowadam | sgd
+    lr: null                      # null = reference 'target' mode: ||D||_F = target_norm * ||W_targets||_F; number = literal eta
+    target_norm: 6.0e-5
+    beta1: 0.9                    # unused by RowAdam (no first moment)
+    beta2: 0.95                   # paper Tab. 4 / reference adam betas (0.9, 0.95)
+    eps: 1.0e-8
+    mismatch_subtraction: True    # uses the students' vLLM log-probs (rollout.calculate_log_probs=True)
+    mismatch_ema: 0.3
+    mismatch_floor: 0.5
+    kl_budget_start: 2.0e-4       # predicted-KL budget per step, annealed to kl_budget_end over kl_budget_steps
+    kl_budget_end: 2.0e-5
+    kl_budget_steps: null         # null = total training steps
+    alpha_max: 3.0                # cap of the step multiplier (reference CLI default)
+    probe_rows: 2                 # rows per rank used by the KL probe
+    probe_tokens: 256             # response positions per probe row
+    targets: q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj
+    seed: 0
+  muon:                           # Muon (Newton-Schulz orthogonalised momentum) on the projection matrices, AdamW on the rest
+    enable: False                 # needs actor_rollout_ref.actor.fsdp_config.use_orig_params=True; exclusive with logra
+    momentum: 0.95
+    nesterov: True
+    ns_steps: 5
+    scale_mode: moonlight         # moonlight = 0.2*sqrt(max(d,k)) x orthogonalised update (AdamW-matched RMS, reuses lr/wd) | none
+    targets: q_proj,k_proj,v_proj,o_proj,gate_proj,up_proj,down_proj
 

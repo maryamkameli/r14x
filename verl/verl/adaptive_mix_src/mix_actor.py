@@ -15,6 +15,8 @@
 Single Process Actor
 """
 
+import math
+import time
 import itertools
 from typing import Iterable, Tuple
 
@@ -59,6 +61,9 @@ elif is_npu_available:
 __all__ = ['MIXDataParallelPPOActor']
 
 from verl.workers.actor.dp_actor import DataParallelPPOActor
+from .logra import (LoGRAState, clean_name, exact_fp32_matmul, is_target, kl_budget, probe_kl_sum, resolve_config as resolve_logra_config,
+                    step_scale, stride_select)
+from .muon import MuonState, newton_schulz5, resolve_config as resolve_muon_config, update_scale
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -90,7 +95,9 @@ class MIXDataParallelPPOActor(DataParallelPPOActor):
                                           weight_decay=1e-2)
         else:
             self.alpha_optimizer = None
-            
+        self.logra_state = None  # LoGRAState, created on the first LoGRA step or restored from a checkpoint
+        self.muon_state = None  # MuonState, created on the first Muon step or restored from a checkpoint
+
     def update_policy(self, data: DataProto):
         # make sure we are in training mode
         self.actor_module.train()
@@ -120,6 +127,17 @@ class MIXDataParallelPPOActor(DataParallelPPOActor):
         for k in ('teacher_logp', 'teacher_mu_mask'):  # r1x4 variant IV: per-token IS on self-sampled teacher traces
             if k in data.batch.keys():
                 select_keys.append(k)
+        logra_cfg = resolve_logra_config(data.meta_info.get('logra'))  # None => existing AdamW path
+        muon_cfg = resolve_muon_config(data.meta_info.get('muon'))  # None => existing AdamW / LoGRA path
+        assert logra_cfg is None or muon_cfg is None, 'meta_info enables both LoGRA and Muon; they are mutually exclusive'
+        if muon_cfg is not None:
+            assert isinstance(self.actor_module, FSDP) and self.actor_module._use_orig_params, (
+                'Muon needs FSDP1 with actor_rollout_ref.actor.fsdp_config.use_orig_params=True '
+                '(FSDP.summon_full_params(..., with_grads=True))')
+        if logra_cfg is not None:
+            for k in ('rollout_log_probs', 'rollout_log_probs_mask'):  # LoGRA mismatch subtraction (paper eq. 17)
+                if k in data.batch.keys():
+                    select_keys.append(k)
         if data.meta_info.get('reset_optim'):  # variant IV switch-off: fresh AdamW m, v, step from the next step()
             self.actor_optimizer.state.clear()
             print('[r1x4] AdamW state cleared at the end of the teacher phase', flush=True)
@@ -129,12 +147,21 @@ class MIXDataParallelPPOActor(DataParallelPPOActor):
         non_tensor_select_keys = ["multi_modal_inputs"] if has_multi_modal_inputs else []
 
         data = data.select(batch_keys=select_keys, non_tensor_batch_keys=non_tensor_select_keys)
+        if logra_cfg is not None:
+            assert isinstance(self.actor_module, FSDP) and self.actor_module._use_orig_params, (
+                'LoGRA needs FSDP1 with actor_rollout_ref.actor.fsdp_config.use_orig_params=True '
+                '(FSDP.summon_full_params(..., with_grads=True))')
+            assert self.ulysses_sequence_parallel_size == 1, 'LoGRA probe forwards need ulysses_sequence_parallel_size=1'
+            metrics_logra_mismatch = self._logra_observe_mismatch(data, logra_cfg)
+            logra_update_idx = 0
         
         # Split to make minibatch iterator for updating the actor
         # See PPO paper for details.
         mini_batches = data.split(self.config.ppo_mini_batch_size)
 
         metrics = {}
+        if logra_cfg is not None:
+            append_to_dict(metrics, metrics_logra_mismatch)
         for _ in range(self.config.ppo_epochs):
             for batch_idx, data in enumerate(mini_batches):
                 # split batch into micro_batches
@@ -150,6 +177,8 @@ class MIXDataParallelPPOActor(DataParallelPPOActor):
 
                 if teacher_diag and batch_idx == 0:
                     append_to_dict(metrics, self._grad_diag(micro_batches, temperature))
+                if logra_cfg is not None:  # predicted-KL probe, reference pass on the current (pre-update) weights
+                    logra_probe = self._logra_probe_before(mini_batch, logra_cfg)
                 self.actor_optimizer.zero_grad()
                 if self.alpha_optimizer is not None:
                     self.alpha_optimizer.zero_grad()
@@ -357,7 +386,15 @@ class MIXDataParallelPPOActor(DataParallelPPOActor):
                     )
                     append_to_dict(metrics, micro_batch_metrics)
 
-                grad_norm = self._optimizer_step()
+                if muon_cfg is not None:
+                    grad_norm, muon_metrics = self._muon_optimizer_step(muon_cfg)
+                    append_to_dict(metrics, muon_metrics)
+                elif logra_cfg is None:
+                    grad_norm = self._optimizer_step()
+                else:
+                    grad_norm, logra_metrics = self._logra_optimizer_step(logra_cfg, logra_probe, temperature, logra_update_idx)
+                    logra_update_idx += 1
+                    append_to_dict(metrics, logra_metrics)
                 mini_batch_metrics = {'actor/grad_norm': grad_norm.detach().item()}
                 append_to_dict(metrics, mini_batch_metrics)
         self.actor_optimizer.zero_grad()
@@ -416,3 +453,280 @@ class MIXDataParallelPPOActor(DataParallelPPOActor):
         if self.alpha_optimizer is not None:
             self.alpha_optimizer.step()
         return grad_norm
+
+    # ------------------------------------------------------------------ Muon (verl/adaptive_mix_src/muon.py)
+    def muon_state_dict(self):
+        return None if self.muon_state is None else self.muon_state.state_dict()
+
+    def load_muon_state_dict(self, sd):
+        self.muon_state = MuonState()
+        self.muon_state.load_state_dict(sd)
+
+    def _muon_optimizer_step(self, cfg):
+        """Muon step on the target projection matrices + the actor AdamW on every other parameter:
+        clip -> (summoned full params/grads, every rank redundantly) M <- mu M + G, U = G + mu M (nesterov) | M,
+        O = NS5(U), W <- W (1 - lr wd) - lr scale O -> target grads set to None on the sharded views ->
+        AdamW.step() (skips grad-None params, incl. weight decay) -> zero grads.
+        lr / wd = the AdamW's param_groups[0] (scheduled lr). Non-finite grad norm => no update at all."""
+        assert self.config.grad_clip is not None
+        t0 = time.time()
+        module = self.actor_module
+        grad_norm = module.clip_grad_norm_(max_norm=self.config.grad_clip)
+        if not torch.isfinite(grad_norm):  # skip Muon and AdamW, keep both states
+            print(f"WARN: rank {torch.distributed.get_rank()} grad_norm is not finite: {grad_norm}; Muon/AdamW step skipped")
+            self.actor_optimizer.zero_grad()
+            if self.alpha_optimizer is not None:
+                self.alpha_optimizer.step()
+            return grad_norm, {'muon/skipped': 1.0, 'muon/time_s': time.time() - t0}
+        if self.muon_state is None:
+            self.muon_state = MuonState()
+        state = self.muon_state
+        group = self.actor_optimizer.param_groups[0]
+        lr = float(group['lr'])
+        wd = float(group.get('weight_decay', 0.0) or 0.0)
+        decay = 1.0 - lr * wd
+        # ||lr scale O||^2, ||dW||^2, ||W||^2 (pre-update), ||M||^2 over targets
+        sums = torch.zeros(4, dtype=torch.float64, device=get_device_id())
+        numel, n_no_grad = 0, 0
+        targets = []  # same nn.Parameter objects as the sharded views outside the summon (use_orig_params)
+        with FSDP.summon_full_params(module, writeback=True, with_grads=True), exact_fp32_matmul(), torch.no_grad():
+            for name, p in module.named_parameters():
+                cname = clean_name(name)
+                if not is_target(cname, p, cfg['targets']):
+                    continue
+                targets.append(p)
+                if p.grad is None:
+                    n_no_grad += 1
+                    continue
+                G = p.grad.to(torch.float32)
+                U = state.direction(cfg, cname, G)
+                M = state.momentum[cname]
+                O = newton_schulz5(U, cfg['ns_steps'])
+                del U, G
+                b = lr * update_scale(p.shape, cfg['scale_mode'])
+                W = p.data
+                W32 = W if W.dtype == torch.float32 else W.to(torch.float32)
+                wsq, wo, osq = W32.square().sum(), (W32 * O).sum(), O.square().sum()
+                a = lr * wd  # dW = -(a W + b O)
+                sums += torch.stack([osq.double() * (b * b),
+                                     wsq.double() * (a * a) + wo.double() * (2.0 * a * b) + osq.double() * (b * b),
+                                     wsq.double(), M.square().sum().double()])
+                numel += O.numel()
+                if W32 is W:
+                    W.mul_(decay).add_(O, alpha=-b)
+                else:
+                    W.copy_(W32.mul_(decay).add_(O, alpha=-b))
+                del O, W32, M
+        for p in targets:  # outside the summon: sharded grad views; AdamW then skips the targets entirely
+            p.grad = None
+        n_mat = len(targets) - n_no_grad
+        del targets
+        self.actor_optimizer.step()
+        self.actor_optimizer.zero_grad()
+        if self.alpha_optimizer is not None:
+            self.alpha_optimizer.step()
+        state.num_updates += 1
+        usq, dsq, wsq, msq = sums.tolist()
+        return grad_norm, {
+            'muon/num_matrices': float(n_mat),
+            'muon/num_no_grad': float(n_no_grad),
+            'muon/lr': lr,
+            'muon/update_rms': math.sqrt(max(usq, 0.0) / numel) if numel > 0 else 0.0,
+            'muon/update_rel_norm': math.sqrt(max(dsq, 0.0)) / math.sqrt(wsq) if wsq > 0 else 0.0,
+            'muon/momentum_norm': math.sqrt(max(msq, 0.0)),
+            'muon/skipped': 0.0,
+            'muon/time_s': time.time() - t0,
+        }
+
+    # ------------------------------------------------------------------ LoGRA (verl/adaptive_mix_src/logra.py)
+    def logra_state_dict(self):
+        return None if self.logra_state is None else self.logra_state.state_dict()
+
+    def load_logra_state_dict(self, sd):
+        self.logra_state = LoGRAState()
+        self.logra_state.load_state_dict(sd)
+
+    @staticmethod
+    def _logra_all_reduce(vals, op=None):
+        t = torch.tensor(vals, dtype=torch.float64, device=get_device_id())
+        if torch.distributed.is_initialized():
+            torch.distributed.all_reduce(t, op=op if op is not None else torch.distributed.ReduceOp.SUM)
+        return t.tolist()
+
+    @torch.no_grad()
+    def _logra_observe_mismatch(self, data, cfg):
+        """Rollout-vs-trainer mismatch kappa (paper App. D.1): mean of rollout_logp - old_log_prob over valid rollout
+        tokens (rollout_log_probs_mask; fallback: student rows) of completed (non-truncated) responses, clamped at 0,
+        EMA-smoothed. Collective on every rank; no valid token anywhere => no measurement, kappa unchanged."""
+        if not cfg['mismatch_subtraction']:
+            return {}
+        b = data.batch
+        dsum, cnt = 0.0, 0.0
+        if 'rollout_log_probs' in b.keys():
+            resp = b['response_mask'].bool()
+            mask = resp & ~resp[:, -1:]  # last response slot used => truncated row
+            if 'rollout_log_probs_mask' in b.keys():
+                mask = mask & b['rollout_log_probs_mask'].bool()
+            else:
+                mask = mask & ~b['prefix_mask'].any(-1, keepdim=True)
+            delta = torch.where(mask, b['rollout_log_probs'].double() - b['old_log_probs'].double(), 0.0)
+            dsum, cnt = float(delta.sum()), float(mask.sum())
+        dsum, cnt = self._logra_all_reduce([dsum, cnt])
+        if self.logra_state is None:
+            self.logra_state = LoGRAState()
+        raw = self.logra_state.observe_mismatch(dsum, cnt, float(cfg['mismatch_ema']))
+        ema = self.logra_state.mismatch_ema
+        return {'logra/mismatch_raw': raw, 'logra/mismatch_tokens': cnt,
+                'logra/mismatch_ema': float('nan') if ema is None else ema}
+
+    @torch.no_grad()
+    def _logra_probe_hidden(self, rows):
+        """Final-norm hidden states (lm_head input) at the probe positions, one unpadded row per forward
+        (same recipe as MIXActorRolloutRefWorker.compute_hidden_stats). Collective: same row count on every rank."""
+        module = self.actor_module
+        norm = next(m for n, m in module.named_modules() if clean_name(n).endswith('model.norm'))
+        box = {}
+        hook = norm.register_forward_hook(lambda m, i, o: box.__setitem__('h', o))
+        was_training = module.training
+        module.eval()
+        out = []
+        try:
+            with torch.autocast(device_type=get_device_name(), dtype=torch.bfloat16):
+                for ids, hpos in rows:
+                    ids = ids.to(get_device_id())[None]
+                    pos = torch.arange(ids.shape[1], device=ids.device)[None]
+                    module(input_ids=ids, position_ids=pos, use_cache=False, logits_to_keep=1, return_dict=True)
+                    out.append(box.pop('h')[0, hpos.to(ids.device)].float())
+        finally:
+            hook.remove()
+            module.train(was_training)
+        if torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1 and module._handle is not None:
+            module._handle.reshard(True)  # FSDP1 root stays unsharded after a no-grad forward
+        return torch.cat(out)
+
+    @torch.no_grad()
+    def _logra_probe_before(self, mini_batch, cfg):
+        """Pick up to probe_rows rows of this rank's mini-batch (student rows first, then teacher rows; rows need a
+        response token), up to probe_tokens evenly strided response positions each, and record their hidden states
+        on the current weights. Returns None on every rank if any rank has no usable row."""
+        b = mini_batch.batch
+        R = b['responses'].shape[-1]
+        resp_mask = b['response_mask'].bool()
+        has = resp_mask.any(-1)
+        student = ~b['prefix_mask'].any(-1)
+        order = torch.cat([torch.nonzero(has & student).flatten(), torch.nonzero(has & ~student).flatten()])
+        order = order[:max(cfg['probe_rows'], 0)]
+        n = int(self._logra_all_reduce([float(order.numel())], op=torch.distributed.ReduceOp.MIN)[0])
+        if n == 0:
+            return None
+        rows = []
+        for i in order[:n].tolist():
+            ids = b['input_ids'][i][b['attention_mask'][i].bool()]
+            n_tok, n_resp = ids.numel(), int(b['attention_mask'][i, -R:].sum())
+            j = torch.nonzero(resp_mask[i, :n_resp]).flatten()
+            j = j[stride_select(j.numel(), cfg['probe_tokens'])]
+            hpos = n_tok - n_resp - 1 + j  # hidden state at hpos predicts response token j
+            hpos = hpos[hpos >= 0]
+            rows.append((ids[:int(hpos.max()) + 1], hpos))  # later tokens cannot affect these positions (causal)
+        return {'rows': rows, 'h0': self._logra_probe_hidden(rows)}
+
+    def _logra_optimizer_step(self, cfg, probe, temperature, update_idx):
+        """LoGRA step replacing AdamW.step() (paper Alg. 1 + sec. 2.3, finite-difference KL probe):
+        clip -> S = G A^T, U = RowAdam/SGD(S), D = -eta U A on every target -> W += D (trial, alpha = 1) ->
+        q = mean KL(pi_before || pi_after) on the probe positions -> alpha = min(alpha_max, sqrt(delta_eff / q)) ->
+        W += (alpha - 1) D. Every rank computes on the full (summoned) matrices; writeback updates its own shard.
+        Non-target parameters are never updated; grads are zeroed afterwards."""
+        assert self.config.grad_clip is not None
+        t0 = time.time()
+        module = self.actor_module
+        grad_norm = module.clip_grad_norm_(max_norm=self.config.grad_clip)
+        if not torch.isfinite(grad_norm):  # skip the update, keep the LoGRA state
+            print(f"WARN: rank {torch.distributed.get_rank()} grad_norm is not finite: {grad_norm}; LoGRA step skipped")
+            self.actor_optimizer.zero_grad()
+            if self.alpha_optimizer is not None:
+                self.alpha_optimizer.step()
+            return grad_norm, {'logra/skipped': 1.0, 'logra/alpha': 0.0, 'logra/time_s': time.time() - t0}
+        if self.logra_state is None:
+            self.logra_state = LoGRAState()
+        state = self.logra_state
+        dev = get_device_id()
+        updates = []  # (clean name, U [d, r], A [r, k], pending RowAdam state)
+        sums = torch.zeros(3, dtype=torch.float64, device=dev)  # ||S||^2, ||U A||^2, ||W||^2 over targets
+        n_no_grad = 0
+        w_head = None
+        with FSDP.summon_full_params(module, writeback=True, with_grads=True), exact_fp32_matmul(), torch.no_grad():
+            if probe is not None:  # tied embedding / lm_head (not a target, unchanged by the step), fp32 copy
+                w_head = module.module.get_output_embeddings().weight.detach().to(torch.float32).clone()
+            targets = []
+            for name, p in module.named_parameters():
+                cname = clean_name(name)
+                if not is_target(cname, p, cfg['targets']):
+                    continue
+                if p.grad is None:
+                    n_no_grad += 1
+                    continue
+                A = state.projection(cfg, cname, p.shape[1], update_idx, p.device)
+                S = p.grad.to(torch.float32) @ A.T
+                U, pending = state.direction(cfg, cname, S)
+                sums += torch.stack([S.square().sum(), ((U @ (A @ A.T)) * U).sum(),
+                                     p.detach().to(torch.float32).square().sum()]).double()
+                del S
+                updates.append((cname, U, A, pending))
+                targets.append(p)
+            sketch_sq, usq, wsq = sums.tolist()
+            if cfg['lr'] is not None:  # paper eq. 4 literally: D = -lr U A
+                eta = float(cfg['lr'])
+            else:  # reference update_mode='target': ||D||_F = target_norm * ||W_targets||_F
+                eta = float(cfg['target_norm']) * math.sqrt(wsq) / math.sqrt(usq) if usq > 0 else 0.0
+            for p, (_, U, A, _) in zip(targets, updates):  # trial step, alpha = 1
+                p.data.add_(U @ A, alpha=-eta)
+            del targets
+        self.actor_optimizer.zero_grad()
+
+        q, n_pos = float('nan'), 0
+        if probe is not None:
+            h1 = self._logra_probe_hidden(probe['rows'])
+            kl_sum = float(probe_kl_sum(probe['h0'], h1, w_head, float(temperature)))
+            kl_sum, n_pos = self._logra_all_reduce([kl_sum, float(h1.shape[0])])
+            q = kl_sum / n_pos if n_pos > 0 else float('nan')
+            del h1
+        del w_head
+        scheduled = kl_budget(cfg)
+        budget = state.effective_budget(cfg, scheduled)
+        if probe is None or not n_pos > 0:
+            alpha, status = 1.0, 'no_probe'  # reference step_scale: no prediction -> unscaled step
+        else:
+            alpha, status = step_scale(q, budget, float(cfg['alpha_max']))
+        if status != 'ok' and torch.distributed.get_rank() == 0:
+            print(f"[LoGRA] step {cfg['step']}: {status} (q={q:.3e}, probe tokens={int(n_pos)}) -> alpha={alpha:.3f}", flush=True)
+        if alpha != 1.0:
+            with FSDP.summon_full_params(module, writeback=True, with_grads=False), exact_fp32_matmul(), torch.no_grad():
+                params = {clean_name(n): p for n, p in module.named_parameters()}
+                for cname, U, A, _ in updates:
+                    params[cname].data.add_(U @ A, alpha=-eta * (alpha - 1.0))
+                del params
+        if alpha > 0:
+            for cname, _, _, pending in updates:
+                state.commit(cname, pending)
+            state.num_updates += 1
+        n_mat = len(updates)
+        del updates
+        if self.alpha_optimizer is not None:
+            self.alpha_optimizer.step()
+        return grad_norm, {
+            'logra/alpha': alpha,
+            'logra/q_pred_kl': q,
+            'logra/kl_budget': scheduled,
+            'logra/kl_budget_eff': budget,
+            'logra/eta': eta,
+            'logra/update_norm': abs(alpha) * eta * math.sqrt(max(usq, 0.0)),
+            'logra/update_rel_norm': abs(alpha) * eta * math.sqrt(max(usq, 0.0)) / math.sqrt(wsq) if wsq > 0 else 0.0,
+            'logra/sketch_norm': math.sqrt(max(sketch_sq, 0.0)),
+            'logra/num_matrices': float(n_mat),
+            'logra/num_no_grad': float(n_no_grad),
+            'logra/probe_tokens': float(n_pos),
+            'logra/q_zero': float(status == 'q_zero'),
+            'logra/q_nonfinite': float(status == 'q_nonfinite'),
+            'logra/skipped': 0.0,
+            'logra/time_s': time.time() - t0,
+        }

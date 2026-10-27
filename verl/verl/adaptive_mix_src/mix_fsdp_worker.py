@@ -932,6 +932,20 @@ class MIXActorRolloutRefWorker(Worker, DistProfilerExtension):
             local_path=local_path, hdfs_path=hdfs_path, global_step=global_step, max_ckpt_to_keep=max_ckpt_to_keep
         )
         dist.barrier()
+        logra_sd = self.actor.logra_state_dict() if getattr(self, "actor", None) is not None else None
+        if logra_sd is not None and local_path is not None:  # LoGRA RowAdam/mismatch state (identical on all ranks)
+            os.makedirs(local_path, exist_ok=True)
+            torch.save(logra_sd, os.path.join(local_path, f"logra_state_rank{self.rank}.pt"))
+            dist.barrier()
+        # Muon momentum buffers: identical on all ranks, so only rank 0 writes; the barrier is outside the rank-0
+        # branch and the condition (muon_state set) is identical on every rank, so there is no collective mismatch.
+        if getattr(self, "actor", None) is not None and self.actor.muon_state is not None and local_path is not None:
+            if dist.get_rank() == 0:
+                os.makedirs(local_path, exist_ok=True)
+                muon_file = os.path.join(local_path, "muon_state.pt")
+                torch.save(self.actor.muon_state_dict(), muon_file + ".tmp")
+                os.replace(muon_file + ".tmp", muon_file)
+            dist.barrier()
 
         if self._is_lora and hasattr(getattr(self, "actor_module", self.actor_module_fsdp), "peft_config"):
             lora_save_path = os.path.join(local_path, "lora_adapter")
@@ -999,6 +1013,14 @@ class MIXActorRolloutRefWorker(Worker, DistProfilerExtension):
         if self._is_offload_param:
             load_fsdp_model_to_gpu(self.actor_module_fsdp)
 
+        logra_path = os.path.join(local_path, f"logra_state_rank{self.rank}.pt") if local_path is not None else None
+        if logra_path is not None and getattr(self, "actor", None) is not None and os.path.exists(logra_path):
+            self.actor.load_logra_state_dict(torch.load(logra_path, map_location="cpu", weights_only=False))
+            print(f"[LoGRA] rank {self.rank}: state restored from {logra_path}", flush=True)
+        muon_path = os.path.join(local_path, "muon_state.pt") if local_path is not None else None
+        if muon_path is not None and getattr(self, "actor", None) is not None and os.path.exists(muon_path):
+            self.actor.load_muon_state_dict(torch.load(muon_path, map_location="cpu", weights_only=False))
+            print(f"[Muon] rank {self.rank}: state restored from {muon_path}", flush=True)
         self.checkpoint_manager.load_checkpoint(
             local_path=local_path, hdfs_path=hdfs_path, del_local_after_load=del_local_after_load
         )

@@ -17,6 +17,16 @@ one optimizer step per training step, prompts retired after 2 consecutive all-co
 | `--p` | percent. Teacher tokens whose **pre-update** policy probability is below p% lose their gradient (dropped, not renormalized). `--p 1` = p < 1 %. `--p 0` = off |
 | `--ches yes/no` | per-token CHES on every negative row: each token's final hidden state h⁻ₜ is scored against S⁺ = Σₜ h⁺ₜ of the group's positive (R1) trace (cosine; `--ches_score ip` for the inner product); the top `--ches_frac` (50 %) of the response tokens are dropped; the shared prefix with y⁺ is never dropped and ≥1 token is kept (the fixed rule from CHES_PER_TOKEN) |
 | `--ranking yes/no` | take the next 1,000 prompts in LUFFY's visit order, teacher-force their R1 trace and their wrong traces under the **current** policy, keep the 100 whose traces are most likely (score = mean token log-likelihood of the pos trace + of the most likely neg trace; `--rank_score min/pos/neg`), train on those 100 **in decreasing likelihood**, then the next 1,000, and so on. The wrong slots of a ranked prompt use its most likely wrong traces first. `no` = plain LUFFY visit order |
+| `--p_rows all/pos/neg` | which teacher rows the `--p` drop applies to; `neg` = only wrong-teacher rows |
+| `--rank_score gold` | AMPO-style score: mean student probability of the gold answer tokens after the correct trace's last `\boxed{` |
+| `--rank_rolling yes/no` | rolling pool: unpicked prompts stay and age; pool topped up to `--rank_pool` in visit order each step |
+| `--rlplus yes/no`, `--rlplus_warmup N`, `--rlplus_cbar c` | teacher-token IS ratio π/(0.75 π_old + 0.25/V) (RL-PLUS), clipped at c; ratio π/π_old for the first N steps |
+| `--mc_skip yes/no`, `--mc_samples k`, `--mc_z z` | all-correct prompts get k extra graded rollouts; whole group skipped iff 1−p̂ ≤ z·√(p̂(1−p̂)/n) |
+| `--logra yes/no` (+ `--logra_rank`, `--logra_refresh`, `--logra_optimizer rowadam/sgd`, `--logra_lr`, `--logra_kl_start`, `--logra_kl_end`, `--logra_alpha_max`) | LoGRA low-rank sketched updates with predicted-KL step control instead of AdamW |
+| `--muon yes/no` (+ `--muon_momentum`, `--muon_nesterov`, `--muon_ns_steps`, `--muon_scale moonlight/none`) | Muon on attention/MLP projections, AdamW on the rest; exclusive with `--logra` |
+| `--hw rtx6000/a40/a100_40/a100_80` | memory profile per GPU type (see `scripts/slurm/README.md`) |
+
+Rewrite-pairs run with these flags: see `docs/REWRITE_PAIRS_LOGRA_RUN.md`.
 
 Variants: **I** `--p 1 --ches yes --ranking yes`, **II** `--p 1 --ches no --ranking yes`, **III** `--p 1 --ches no --ranking no`.
 
