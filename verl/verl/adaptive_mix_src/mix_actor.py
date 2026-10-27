@@ -124,7 +124,7 @@ class MIXDataParallelPPOActor(DataParallelPPOActor):
             select_keys.append('target_probs')
         if 'ches_keep' in data.batch.keys():  # r1x4 per-token CHES keep mask
             select_keys.append('ches_keep')
-        for k in ('teacher_logp', 'teacher_mu_mask'):  # r1x4 variant IV: per-token IS on self-sampled teacher traces
+        for k in ('teacher_logp', 'teacher_mu_mask', 'teacher_gen_logp'):  # r1x4: IS (variant IV / RL-PLUS); generating-teacher log-probs
             if k in data.batch.keys():
                 select_keys.append(k)
         logra_cfg = resolve_logra_config(data.meta_info.get('logra'))  # None => existing AdamW path
@@ -265,6 +265,7 @@ class MIXDataParallelPPOActor(DataParallelPPOActor):
                             **({'token_keep': model_inputs['ches_keep']} if 'ches_keep' in model_inputs else {}),
                             **({'teacher_logp': model_inputs['teacher_logp'], 'teacher_mu_mask': model_inputs['teacher_mu_mask']}
                                if 'teacher_mu_mask' in model_inputs else {}),
+                            **({'teacher_gen_logp': model_inputs['teacher_gen_logp']} if 'teacher_gen_logp' in model_inputs else {}),
                         )
                         pg_loss = ret_dict['pg_loss']
                         off_pg_loss = ret_dict['off_pg_loss']
@@ -294,7 +295,7 @@ class MIXDataParallelPPOActor(DataParallelPPOActor):
                                 
                         if 'on_policy_prob' in ret_dict:
                             data['actor/on_policy_prob'] = ret_dict['on_policy_prob'].detach().item()
-                        for key in ('teacher_lowp_drop_frac', 'ches_drop_frac', 'teacher_neg_pweight_mean'):
+                        for key in ('teacher_lowp_drop_frac', 'ches_drop_frac', 'teacher_gen_lowp_drop_frac', 'neg_weight_mean'):
                             if key in ret_dict:
                                 data[f'actor/{key}'] = ret_dict[key].detach().item()
                         if 'off_ratio_mean' in ret_dict:
@@ -418,7 +419,8 @@ class MIXDataParallelPPOActor(DataParallelPPOActor):
                 _, lp = self._forward_micro_batch(mi, temperature=temperature, calculate_entropy=False)
                 ret = loss_fn(old_log_prob=mi['old_log_probs'], log_prob=lp, advantages=adv, eos_mask=mi['response_mask'],
                               prefix_mask=mi['prefix_mask'], config=self.config, token_keep=mi.get('ches_keep'),
-                              teacher_logp=mi.get('teacher_logp'), teacher_mu_mask=mi.get('teacher_mu_mask'))
+                              teacher_logp=mi.get('teacher_logp'), teacher_mu_mask=mi.get('teacher_mu_mask'),
+                              teacher_gen_logp=mi.get('teacher_gen_logp'))
                 scale = mi['response_mask'].shape[0] / self.config.ppo_mini_batch_size if self.config.use_dynamic_bsz else 1 / self.gradient_accumulation
                 (ret['pg_loss'] * scale).backward()
             saved[part] = [p.grad.detach().float().clone() if p.grad is not None else None for p in params]

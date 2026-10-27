@@ -109,7 +109,10 @@ class Curriculum:
 
 class R1x4Data:
     def __init__(self, path, tokenizer, max_prompt_length, max_response_length, teacher_eos):
-        t = pq.read_table(path)
+        # the clean_and_score.py columns of student token ids / log-probs are not used here: not loaded (memory)
+        cols = [c for c in pq.read_schema(path).names if c not in ('correct_token_ids', 'correct_token_logps',
+                                                                   'wrong_token_ids', 'wrong_token_logps')]
+        t = pq.read_table(path, columns=cols)
         self.rows = t.to_pylist()
         assert all(a['visit'] <= b['visit'] for a, b in zip(self.rows, self.rows[1:])), 'rows must be sorted by LUFFY visit'
         self.tok, self.P, self.R, self.eos = tokenizer, max_prompt_length, max_response_length, teacher_eos
@@ -460,7 +463,7 @@ class R1x4Trainer(MIXRayDAPOTrainer):
             teacher_on = lam > 0
             T = (TEACHERS if layout == 'r1x4' else K_app) if teacher_on else 0
             G = STUDENTS + T
-            plan, t_mu, t_kind = [], [], []
+            plan, t_mu, t_kind, t_gen = [], [], [], []  # t_gen: generating-teacher log-probs of wrong rows (or None)
             if teacher_on:
                 t_rows, t_resp = [], []
                 for p, i in enumerate(rows):
@@ -477,7 +480,7 @@ class R1x4Trainer(MIXRayDAPOTrainer):
                         n_pos, wr = K_app, []
                         pos_pick = list(rng.choice(max(len(mu), 1), K_app, replace=len(mu) < K_app))
                     for c in pos_pick:
-                        t_rows.append(i), t_kind.append(1)
+                        t_rows.append(i), t_kind.append(1), t_gen.append(None)
                         if mu:  # self-sampled correct trace with its log mu
                             ids, lps = mu[c % len(mu)]
                             t_resp.append(ids[:self.data.R]), t_mu.append(lps[:self.data.R])
@@ -485,6 +488,7 @@ class R1x4Trainer(MIXRayDAPOTrainer):
                             t_resp.append(self.data.teacher_ids(i, r['correct_text'])), t_mu.append(None)
                     for j in wr:
                         t_rows.append(i), t_resp.append(self.data.teacher_ids(i, r['wrong_texts'][j])), t_kind.append(0), t_mu.append(None)
+                        t_gen.append(r['wrong_teacher_logps'][j] if 'wrong_teacher_logps' in r else None)
                     plan.append(len(wr))
                 tb = self._rows_proto(t_rows, t_resp)
                 tb.non_tensor_batch['reward_model'] = np.array([self.data.rows[i]['reward_model'] for i in t_rows], dtype=object)
@@ -580,6 +584,16 @@ class R1x4Trainer(MIXRayDAPOTrainer):
                         row = (q // T) * G + q % T
                         tl[row, :len(lps)], tm[row, :len(lps)] = lps, True
                 batch.batch['teacher_logp'], batch.batch['teacher_mu_mask'] = tl, tm & rmask.bool()
+            if teacher_on and float(self.config.actor_rollout_ref.actor.get('teacher_token_min_teacher_prob', 0.0)) > 0:
+                # generating-teacher log-prob per wrong-teacher token (clean_and_score.py wrong_teacher_logps, aligned with
+                # teacher_ids); 0 elsewhere = p 1, never dropped by the loss
+                assert 'wrong_teacher_logps' in self.data.rows[rows[0]], '--p_teacher needs wrong_teacher_logps in --data'
+                tg = torch.zeros(len(batch), R)
+                for q, lps in enumerate(t_gen):
+                    if lps is not None:
+                        row, n = (q // T) * G + q % T, min(len(lps), R)
+                        tg[row, :n] = torch.tensor(lps[:n])
+                batch.batch['teacher_gen_logp'] = tg * rmask.float()
             batch.non_tensor_batch['uid'] = np.array([str(i) for i in rows for _ in range(G)], dtype=object)
             batch.meta_info['global_token_num'] = batch.batch['attention_mask'].sum(-1).tolist()
             # ---- pre-update policy log-probs (p filter uses them; on-policy ratio baseline)

@@ -1,5 +1,6 @@
 import numpy as np
 import torch
+import math
 from collections import defaultdict
 from omegaconf import DictConfig
 from typing import Any, Callable, Optional
@@ -84,6 +85,7 @@ def compute_token_on_off_policy_loss(
     token_keep=None,
     teacher_logp=None,
     teacher_mu_mask=None,
+    teacher_gen_logp=None,
 ):
     """
     Args:
@@ -262,7 +264,6 @@ def compute_token_on_off_policy_loss(
     if teacher_mu_mask is not None and teacher_mu_mask.any():
         # r1x4 variant IV, truncated per-token IS on self-sampled teacher tokens: -A * sg(min(cbar, pi/mu)) * log pi,
         # in fp32 log space (clamping the DETACHED ratio keeps a nonzero gradient on truncated tokens; not PPO-clip)
-        import math
         logr = (log_prob.float() - teacher_logp.float()).clamp(min=config.get("is_logratio_min", -20.0), max=math.log(config.get("is_cbar", 1.0)))
         is_losses = -advantages * logr.exp().detach() * log_prob.float()
         off_pg_losses = torch.where(teacher_mu_mask.bool(), is_losses.to(off_pg_losses.dtype), off_pg_losses)
@@ -293,7 +294,7 @@ def compute_token_on_off_policy_loss(
         
     # r1x4: drop (not renormalize) tokens. Under loss_remove_token_mean the normalizer is the constant
     # response length, so dropped tokens leave and the rest keep their weight.
-    teacher_lowp_drop_frac = ches_drop_frac = teacher_neg_pweight_mean = None
+    teacher_lowp_drop_frac = ches_drop_frac = teacher_gen_lowp_drop_frac = neg_weight_mean = None
     min_p = config.get("teacher_token_min_prob", 0.0) or 0.0
     if min_p > 0:  # teacher tokens the PRE-UPDATE policy finds unlikely (p_old < min_p) lose their gradient
         tok_t = prefix_mask.bool() & eos_mask.bool()
@@ -304,15 +305,23 @@ def compute_token_on_off_policy_loss(
         low = tok_t & (torch.exp(old_log_prob) < min_p)
         pg_losses = pg_losses * (~low).to(pg_losses.dtype)
         teacher_lowp_drop_frac = low.sum().float() / torch.clamp(tok_t.sum().float(), min=1.0)
-    if config.get("teacher_neg_pweight", False):
-        # r1x4 (Ivan 2026-10-27): tokens of NEGATIVE teacher rows that survive the p-drop above are weighted by sg(p_old),
-        # the pre-update student probability: -A * log pi pushes a token down with gradient ~1/p in probability space,
-        # x p_old turns it into |A| * grad p, so unlikely wrong-teacher tokens are pushed least
+    min_pt = config.get("teacher_token_min_teacher_prob", 0.0) or 0.0
+    if min_pt > 0 and teacher_gen_logp is not None:
+        # r1x4 (Ivan 2026-10-27): tokens of NEGATIVE teacher rows that the generating teacher itself found unlikely
+        # (p_teacher < min_pt, log-probs stored with the data; 0 = no value -> never dropped) lose their gradient too:
+        # with top_p < 1 / top_k > 0 sampling, such tokens bias the update and can make it vanish
         tok_n = prefix_mask.bool() & eos_mask.bool() & (advantages * eos_mask).sum(-1, keepdim=True).lt(0)
-        p_old = torch.exp(old_log_prob.float())
-        pg_losses = pg_losses * torch.where(tok_n, p_old, torch.ones_like(p_old)).to(pg_losses.dtype)
-        kept = tok_n & ~low if min_p > 0 else tok_n
-        teacher_neg_pweight_mean = (p_old * kept).sum() / torch.clamp(kept.sum().float(), min=1.0)
+        low_t = tok_n & (teacher_gen_logp.float() < math.log(min_pt))
+        pg_losses = pg_losses * (~low_t).to(pg_losses.dtype)
+        teacher_gen_lowp_drop_frac = low_t.sum().float() / torch.clamp(tok_n.sum().float(), min=1.0)
+    if config.get("neg_one_minus_p", False):
+        # r1x4 (Ivan 2026-10-27): every token of a NEGATIVE row (teacher or student) is weighted by 1 - sg(p_old), so
+        # tokens the student already finds likely are pushed down little and its existing knowledge is kept
+        # (arXiv 2506.01347, "preserving high-confidence priors")
+        tok_neg = eos_mask.bool() & (advantages * eos_mask).sum(-1, keepdim=True).lt(0)
+        w = 1.0 - torch.exp(old_log_prob.float())
+        pg_losses = pg_losses * torch.where(tok_neg, w, torch.ones_like(w)).to(pg_losses.dtype)
+        neg_weight_mean = (w * tok_neg).sum() / torch.clamp(tok_neg.sum().float(), min=1.0)
     if token_keep is not None:  # per-token CHES: dropped tokens of negative rows lose their gradient
         drop = eos_mask.bool() & ~token_keep.bool()
         pg_losses = pg_losses * (~drop).to(pg_losses.dtype)
@@ -344,7 +353,8 @@ def compute_token_on_off_policy_loss(
         "off_ratio_min_clip_frac": off_ratio_min_clip_frac,
         **({"teacher_lowp_drop_frac": teacher_lowp_drop_frac} if teacher_lowp_drop_frac is not None else {}),
         **({"ches_drop_frac": ches_drop_frac} if ches_drop_frac is not None else {}),
-        **({"teacher_neg_pweight_mean": teacher_neg_pweight_mean} if teacher_neg_pweight_mean is not None else {}),
+        **({"teacher_gen_lowp_drop_frac": teacher_gen_lowp_drop_frac} if teacher_gen_lowp_drop_frac is not None else {}),
+        **({"neg_weight_mean": neg_weight_mean} if neg_weight_mean is not None else {}),
     }
 @register_policy_loss("mixed_seq_off_policy_loss")
 def compute_token_on_seq_off_policy_loss(

@@ -144,7 +144,8 @@ class ActorConfig(BaseConfig):
     num_off_policy_targets: int = 2
     teacher_token_min_prob: float = 0.0        # r1x4: drop teacher tokens with pre-update p < this (0 = off)
     teacher_token_min_prob_rows: str = "all"    # all | pos | neg
-    teacher_neg_pweight: bool = False           # r1x4: negative teacher tokens weighted by sg(p_old) after the p-drop
+    teacher_token_min_teacher_prob: float = 0.0  # r1x4: drop negative-teacher tokens with generating-teacher p < this
+    neg_one_minus_p: bool = False               # r1x4: every negative-row token weighted by 1 - sg(p_old)
     loss_row_mean_fix: bool = False             # per-row weight 1/(L*mini) also under dynamic bsz
     is_cbar: float = 1.0                        # r1x4 variant IV: truncation of the per-token IS ratio
     is_logratio_min: float = -20.0              # r1x4 variant IV: lower clamp on log(pi/mu) (fp32)

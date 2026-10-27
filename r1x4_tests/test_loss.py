@@ -44,12 +44,27 @@ ref = total([[i] for i in range(B)], False)                   # micro=1: the ori
 assert torch.allclose(total([[0, 1, 2], [3, 4], [5, 6, 7]], True), ref, atol=1e-7), 'fix must equal micro=1'
 assert not torch.allclose(total([[0, 1, 2], [3, 4], [5, 6, 7]], False), ref), 'unfixed dynamic split should differ'
 print('row-mean fix ok: dynamic split == micro=1; unfixed dynamic split differs (the AMPO weighting bug)')
-# negative-teacher p-weight: after the p-drop, tokens of negative teacher rows get x sg(p_old); others unchanged
-g3, o3 = grad(teacher_token_min_prob=0.01, teacher_neg_pweight=True)
+# generating-teacher p-drop: negative teacher tokens with p_teacher < 0.01 lose their gradient too; others unchanged
+tgl = torch.randn(B, L).clamp(max=0) * 3
+tgl = torch.where(pre, tgl, torch.zeros_like(tgl))           # 0 (= p 1) outside teacher rows, as the trainer stores it
+def grad2(**kw):
+    lp.grad = None
+    out = F(olp, lp, adv, eos, pre, config=cfg(**kw), teacher_gen_logp=tgl)
+    out['pg_loss'].backward()
+    return lp.grad.clone(), out
 neg_t = pre & eos.bool() & (adv.sum(-1, keepdim=True) < 0)
-assert torch.allclose(g3[neg_t], (g1 * olp.exp())[neg_t], atol=1e-6), 'neg teacher tokens: grad x p_old'
-assert torch.equal(g3[~neg_t], g1[~neg_t]), 'pos teacher and student tokens unchanged'
-assert torch.equal((g3 == 0) & neg_t, (g1 == 0) & neg_t), 'p-dropped tokens stay dropped'
-kept = neg_t & (olp.exp() >= 0.01)
-assert abs(float(o3['teacher_neg_pweight_mean']) - float(olp.exp()[kept].mean())) < 1e-6
-print('neg p-weight ok: mean weight', float(o3['teacher_neg_pweight_mean']), 'on', int(kept.sum()), 'tokens')
+g4, o4 = grad2(teacher_token_min_prob=0.01, teacher_token_min_prob_rows='neg', teacher_token_min_teacher_prob=0.01)
+g1n, _ = grad2(teacher_token_min_prob=0.01, teacher_token_min_prob_rows='neg')
+low_t = neg_t & (tgl.exp() < 0.01)
+assert torch.equal((g4 == 0) & (g1n != 0), low_t), 'teacher p-drop must zero exactly negative teacher tokens with p_teacher < 0.01'
+assert torch.equal(g4[~low_t], g1n[~low_t]), 'all other tokens unchanged'
+assert abs(float(o4['teacher_gen_lowp_drop_frac']) - float(low_t.sum() / neg_t.sum())) < 1e-6
+print('teacher p-drop ok: dropped', int(low_t.sum()), 'of', int(neg_t.sum()), 'negative teacher tokens')
+# 1 - p weight: every token of a negative row (teacher AND student) x (1 - sg(p_old)); positive rows unchanged
+g5, o5 = grad2(teacher_token_min_prob=0.01, teacher_token_min_prob_rows='neg', teacher_token_min_teacher_prob=0.01,
+               neg_one_minus_p=True)
+neg_all = eos.bool() & (adv.sum(-1, keepdim=True) < 0)
+assert torch.allclose(g5[neg_all], (g4 * (1 - olp.exp()))[neg_all], atol=1e-6), 'negative tokens: grad x (1 - p_old)'
+assert torch.equal(g5[~neg_all], g4[~neg_all]), 'positive rows unchanged'
+assert (neg_all & ~pre).any() and (g5[neg_all & ~pre] != g4[neg_all & ~pre]).any(), 'student negative rows are weighted too'
+print('1-p weight ok: mean weight', float(o5['neg_weight_mean']), 'on', int(neg_all.sum()), 'negative tokens (teacher + student)')
