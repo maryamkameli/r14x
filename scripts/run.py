@@ -57,6 +57,8 @@ ap.add_argument('--ches_frac', type=float, default=0.5)
 ap.add_argument('--ches_score', default='cos', choices=['cos', 'ip'])
 ap.add_argument('--ches_rows', default='all', choices=['all', 'teacher', 'student'])
 ap.add_argument('--p_rows', default='all', choices=['all', 'pos', 'neg'])
+ap.add_argument('--neg_pweight', type=yes, default=False,
+                help='weight every negative-teacher token kept by --p by its pre-update student probability sg(p_old)')
 ap.add_argument('--is', dest='isamp', type=yes, default=False, help='variant IV: truncated per-token IS on self-sampled correct teacher traces')
 ap.add_argument('--anneal', type=yes, default=False, help='variant IV: teacher weight cosine-annealed to 0 at T_a, then pure GRPO-4')
 ap.add_argument('--anneal_frac', type=float, default=0.2)
@@ -134,7 +136,7 @@ name = a.name or '-'.join(['R1X4', dset, m['tag'], f'P{a.p:g}PCT' if a.p > 0 els
                           + (['ISTRUNC'] if a.isamp else []) + ([f'ANNEAL{a.anneal_frac:g}'] if a.anneal else [])
                           + ([f'APPEND{a.k_teacher}POS'] if a.layout == 'append' else []) + (['STUDENTBASE'] if a.baseline == 'student' else [])
                           + ([a.schedule.upper()] if a.anneal and a.schedule != 'cosine' else []) + ([f'HOLD{a.hold_steps}'] if a.hold_steps else [])
-                          + ([f'NEGW{a.neg_weight:g}'] if a.neg_weight != 1 else []) + ([f'ENT{a.entropy:g}'] if a.entropy != 0.001 else [])
+                          + ([f'NEGW{a.neg_weight:g}'] if a.neg_weight != 1 else []) + (['NEGPW'] if a.neg_pweight else []) + ([f'ENT{a.entropy:g}'] if a.entropy != 0.001 else [])
                           + (['ENTSTUDENTONLY'] if a.entropy_student_only else []) + ([f'LENREF{a.len_ref:g}'] if a.len_ref > 0 else [])
                           + (['GATEALLFAIL'] if a.gate == 'all_fail' else []) + ([f'LAMBDA0{a.lambda0:g}'] if a.lambda0 != 1 else [])
                           + ([f'RLPLUS{a.rlplus_warmup}'] if a.rlplus else []) + ([f'MCSKIP{a.mc_samples}'] if a.mc_skip else [])
@@ -175,6 +177,7 @@ ov = [
     'actor_rollout_ref.actor.loss_remove_token_mean=True', 'actor_rollout_ref.actor.loss_remove_clip=True',
     'actor_rollout_ref.actor.loss_row_mean_fix=True',
     f'actor_rollout_ref.actor.teacher_token_min_prob={a.p / 100.0}', f'actor_rollout_ref.actor.teacher_token_min_prob_rows={a.p_rows}',
+    f'actor_rollout_ref.actor.teacher_neg_pweight={a.neg_pweight}',
     f'actor_rollout_ref.actor.checkpoint.save_contents=[{a.ckpt_contents}]',
     'actor_rollout_ref.ref.use_ref=False',
     # rollout

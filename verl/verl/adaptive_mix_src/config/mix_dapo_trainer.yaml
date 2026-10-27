@@ -59,6 +59,7 @@ actor_rollout_ref:
     all_max_clip: -1
     teacher_token_min_prob: 0.0       # r1x4: drop teacher tokens with pre-update p < this (0 = off)
     teacher_token_min_prob_rows: all  # all | pos | neg teacher rows
+    teacher_neg_pweight: False        # r1x4: negative teacher tokens weighted by sg(p_old) after the p-drop
     loss_row_mean_fix: False          # True: per-row weight 1/(L*mini) also under dynamic bsz (AMPO default: off)
     is_cbar: 1.0                      # r1x4 variant IV: per-token IS ratio truncation c-bar
     is_logratio_min: -20.0            # r1x4 variant IV: lower clamp on log(pi/mu)

@@ -44,3 +44,12 @@ ref = total([[i] for i in range(B)], False)                   # micro=1: the ori
 assert torch.allclose(total([[0, 1, 2], [3, 4], [5, 6, 7]], True), ref, atol=1e-7), 'fix must equal micro=1'
 assert not torch.allclose(total([[0, 1, 2], [3, 4], [5, 6, 7]], False), ref), 'unfixed dynamic split should differ'
 print('row-mean fix ok: dynamic split == micro=1; unfixed dynamic split differs (the AMPO weighting bug)')
+# negative-teacher p-weight: after the p-drop, tokens of negative teacher rows get x sg(p_old); others unchanged
+g3, o3 = grad(teacher_token_min_prob=0.01, teacher_neg_pweight=True)
+neg_t = pre & eos.bool() & (adv.sum(-1, keepdim=True) < 0)
+assert torch.allclose(g3[neg_t], (g1 * olp.exp())[neg_t], atol=1e-6), 'neg teacher tokens: grad x p_old'
+assert torch.equal(g3[~neg_t], g1[~neg_t]), 'pos teacher and student tokens unchanged'
+assert torch.equal((g3 == 0) & neg_t, (g1 == 0) & neg_t), 'p-dropped tokens stay dropped'
+kept = neg_t & (olp.exp() >= 0.01)
+assert abs(float(o3['teacher_neg_pweight_mean']) - float(olp.exp()[kept].mean())) < 1e-6
+print('neg p-weight ok: mean weight', float(o3['teacher_neg_pweight_mean']), 'on', int(kept.sum()), 'tokens')

@@ -294,7 +294,7 @@ class MIXDataParallelPPOActor(DataParallelPPOActor):
                                 
                         if 'on_policy_prob' in ret_dict:
                             data['actor/on_policy_prob'] = ret_dict['on_policy_prob'].detach().item()
-                        for key in ('teacher_lowp_drop_frac', 'ches_drop_frac'):
+                        for key in ('teacher_lowp_drop_frac', 'ches_drop_frac', 'teacher_neg_pweight_mean'):
                             if key in ret_dict:
                                 data[f'actor/{key}'] = ret_dict[key].detach().item()
                         if 'off_ratio_mean' in ret_dict:
