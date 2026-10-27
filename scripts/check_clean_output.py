@@ -5,7 +5,7 @@
 Checks per row: stored token ids == R1x4Data.teacher_ids(row, text) (same tokenizer/EOS/cut), one log-prob per token,
 all log-probs <= 0 and finite, the EOS is the last token; no error-flag phrase and no CJK left; prints one example.
 """
-import math, os, sys
+import math, os, re, sys
 
 KIT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(KIT, 'verl'))
@@ -19,7 +19,8 @@ path = sys.argv[1]
 tok = AutoTokenizer.from_pretrained(sys.argv[2] if len(sys.argv) > 2 else 'Qwen/Qwen3-0.6B')
 eos = tok.convert_tokens_to_ids('<|im_end|>')
 data = R1x4Data(path, tok, 1536, 8192, eos)  # the trainer's loader (asserts visit order)
-bad = {'ids_mismatch': 0, 'len_mismatch': 0, 'logp_invalid': 0, 'no_eos_end': 0, 'flag_left': 0, 'cjk_left': 0}
+bad = {'ids_mismatch': 0, 'len_mismatch': 0, 'logp_invalid': 0, 'no_eos_end': 0, 'flag_left': 0, 'cjk_left': 0,
+       'empty_think_left': 0}
 for i, r in enumerate(data.rows):
     for text, ids, lps in [(r['correct_text'], r['correct_token_ids'], r['correct_token_logps']),
                            (r['wrong_texts'][0], r['wrong_token_ids'][0], r['wrong_token_logps'][0])]:
@@ -30,6 +31,7 @@ for i, r in enumerate(data.rows):
         bad['no_eos_end'] += ids[-1] != eos and len(ids) < 8192
         bad['flag_left'] += bool(error_flags(text))
         bad['cjk_left'] += has_cjk(text)
+        bad['empty_think_left'] += bool(re.match(r'\s*<think>\s*</think>', text))
 print(f'{path}: {len(data.rows)} rows, visits {data.rows[0]["visit"]}..{data.rows[-1]["visit"]}')
 print('problems found:', bad, '-> OK' if not any(bad.values()) else '-> CHECK')
 r = data.rows[0]

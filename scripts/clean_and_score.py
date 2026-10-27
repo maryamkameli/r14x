@@ -7,8 +7,8 @@ right_text, wrong_text, ...). For each problem and each of right_text / wrong_te
   2. reject the text if it still has a flag (e.g. next to the \\boxed answer) or any CJK character
   3. re-grade with the trainer's grader: right must stay correct (1), wrong must stay wrong (0)
   4. teacher-force the final text under the TRAINING prompt with the generating model (--model) and store the log-prob
-     of every response token. Tokenization = R1x4Data.teacher_ids (verl/r1x4/trainer.py): the stored text (with the
-     '<think>\\n\\n</think>\\n\\n' prefix of Qwen3's non-thinking template, as build_rewrite_pairs.py stores it), minus
+     of every response token. Tokenization = R1x4Data.teacher_ids (verl/r1x4/trainer.py): the stored text (an empty
+     leading <think></think> block is removed, Ivan 2026-10-26; build_rewrite_pairs.py used to add one), minus
      '<think>\\n' when the prompt already ends with it, + EOS, cut at --max_response_length; the prompt is the dataset
      chat with the model's default chat template. The log-probs therefore line up 1:1 with the trainer's response tokens.
      Computed by vLLM prompt_logprobs (logprob of each given token; no sampling), bf16.
@@ -22,7 +22,7 @@ Output parquet (R1x4 row format of data/build_rewrite_pairs.py + log-probs), sor
   python scripts/clean_and_score.py --pairs pairs_right_wrong_qwen3-0.6b_26904.parquet --out rw_pairs_clean_lp.parquet
   python scripts/clean_and_score.py --pairs ... --first 64 --out /tmp/t.parquet      # quick check
 """
-import argparse, collections, json, os, sys
+import argparse, collections, json, os, re, sys
 
 # vLLM's engine process must be spawned, not forked: the grader's worker processes (fork) run in this process too
 os.environ.setdefault('VLLM_WORKER_MULTIPROC_METHOD', 'spawn')
@@ -31,7 +31,14 @@ sys.path.insert(0, os.path.join(KIT, 'verl'))
 sys.path.insert(0, os.path.join(KIT, 'scripts'))
 from trace_filters import cut_error_flags, error_flags, has_cjk  # noqa: E402
 
-EMPTY_THINK = '<think>\n\n</think>\n\n'
+
+def strip_empty_think(text):
+    """Ivan 2026-10-26: drop a leading <think></think> block if it is empty (whitespace only); non-empty blocks are kept.
+    Texts are stored WITHOUT the empty block that build_rewrite_pairs.py used to add."""
+    m = re.match(r'\s*<think>(\s*)</think>\s*', text)
+    return (text[m.end():], True) if m else (text, False)
+
+
 ap = argparse.ArgumentParser(allow_abbrev=False, description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
 ap.add_argument('--pairs', required=True)
 ap.add_argument('--model', default='Qwen/Qwen3-0.6B', help='the model that generated the texts (log-probs under it)')
@@ -54,7 +61,8 @@ def response_ids(tok, prompt_text, text, eos):
 
 
 def clean(text):
-    """-> (cleaned text or None if rejected, reason, n_cut). Text is stored without the empty think prefix here."""
+    """-> (cleaned text or None if rejected, reason, n_cut). Empty think block removed, no prefix added."""
+    text, _ = strip_empty_think(text)
     new, n = cut_error_flags(text)
     if error_flags(new):
         return None, 'flag_kept', n
@@ -113,7 +121,7 @@ def main():
     for r, rc, wc, rn, wn in keep:
         rows.append({'data_source': r['data_source'], 'prompt': r['prompt'],
                      'reward_model': {'ground_truth': r['ground_truth'], 'style': 'rule'},
-                     'correct_text': EMPTY_THINK + rc, 'wrong_texts': [EMPTY_THINK + wc],
+                     'correct_text': rc, 'wrong_texts': [wc],
                      'wrong_meta': [json.dumps({'model': a.model, 'kind': 'rewrite_' + r.get('wrong_task', 'wrong'),
                                                 'sentences_cut': wn})],
                      'luffy_index': r['luffy_index'], 'visit': r['visit'], 'correct_sentences_cut': rn})
