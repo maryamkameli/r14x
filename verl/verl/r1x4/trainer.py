@@ -418,6 +418,9 @@ class R1x4Trainer(MIXRayDAPOTrainer):
         metrics.update({'ches/neg_rows': len(negs), 'ches/drop_frac_of_neg_tokens': dropped / max(cand_n, 1)})
         return keep
 
+    def _val0_path(self):
+        return os.path.join(self.config.trainer.default_local_dir, 'initial_val.json')
+
     # --------------------------------------------------------------- fit
     def fit(self):
         from verl.utils.tracking import Tracking
@@ -430,6 +433,9 @@ class R1x4Trainer(MIXRayDAPOTrainer):
             vm['val/avg_score'] = float(np.mean([v for k, v in vm.items() if k.startswith('val/test_score/')]))
             pprint(vm)
             logger.log(data=vm, step=0)
+            os.makedirs(self.config.trainer.default_local_dir, exist_ok=True)
+            with open(self._val0_path(), 'w') as f:  # kept across resumes for the abort rule
+                json.dump({'val/avg_score': vm['val/avg_score']}, f)
             if self.config.trainer.get('val_only', False):
                 return
         B, P = self.config.data.train_batch_size, self.config.data.max_prompt_length
@@ -437,6 +443,7 @@ class R1x4Trainer(MIXRayDAPOTrainer):
         self.global_steps += 1
         while self.global_steps <= self.total_training_steps:
             metrics, timing, t_step = {}, {}, time.time()
+            abort = False
             rows = self._next_rows(B, metrics, timing)
             if len(rows) < B:
                 print('[r1x4] dataset exhausted (every prompt retired)')
@@ -568,6 +575,7 @@ class R1x4Trainer(MIXRayDAPOTrainer):
             # grpo_split). After the teacher phase both are the student mean, i.e. GRPO-4.
             sg = scores_row.view(B, G)
             base = sg[:, T:].mean(-1, keepdim=True) if self.rc.get('baseline', 'group') == 'student' else sg.mean(-1, keepdim=True)
+            base = base + float(self.rc.get('delta_v', 0.0) or 0.0)  # AsymRE: delta_v < 0 favours positives (before teacher x lambda_t)
             adv_row = (sg - base).view(-1) * group_ok.float()
             if teacher_on and an.enable:  # teacher rows: x lambda_t x gate x neg weight x optional length normalisation
                 gate = (s_scores.sum(-1) == 0).float() if an.gate == 'all_fail' else torch.ones(B)
@@ -736,6 +744,14 @@ class R1x4Trainer(MIXRayDAPOTrainer):
                 vm['val/avg_score'] = float(np.mean([v for k, v in vm.items() if k.startswith('val/test_score/')]))
                 metrics.update(vm)
                 timing['testing'] = time.time() - t0
+                frac = float(self.rc.get('abort_val_frac', 0.0) or 0.0)
+                if frac > 0 and os.path.exists(self._val0_path()):
+                    with open(self._val0_path()) as f:
+                        v0 = json.load(f)['val/avg_score']
+                    if vm['val/avg_score'] < frac * v0:
+                        abort = True
+                        print(f'[r1x4] ABORT: val/avg_score {vm["val/avg_score"]:.4f} < {frac:g} x initial {v0:.4f} at step '
+                              f'{self.global_steps}', flush=True)
             saved = sf > 0 and (last or self.global_steps % sf == 0)
             if saved:
                 t0 = time.time()
@@ -764,6 +780,10 @@ class R1x4Trainer(MIXRayDAPOTrainer):
                           f'{self.global_steps}, stopping (resume with --resume auto)', flush=True)
             metrics.update({f'timing_s/{k}': v for k, v in timing.items()})
             logger.log(data=metrics, step=self.global_steps)
+            if abort:  # marker read by scripts/slurm/r1x4_rewrite.sbatch so the chain does not resume
+                with open(os.path.join(self.config.trainer.default_local_dir, 'ABORTED'), 'w') as f:
+                    f.write(f'step {self.global_steps}\n')
+                break
             if stop:
                 break
             self.global_steps += 1

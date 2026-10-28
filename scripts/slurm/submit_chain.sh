@@ -7,7 +7,7 @@
 # Extra sbatch args come last and override the profile defaults (-p, -t, -c, --mem, -A ...), e.g.
 #   scripts/slurm/submit_chain.sh a100x4 3 -A mygroup -t 24:00:00
 # Exported to the jobs (set them in the calling shell): STEPS (260), OPTIM (muon|logra|adamw), KIT, ROOT, A100_MEM,
-# NAME, RUN_ARGS, OVERRIDES, MARGIN_MIN, PYENV (see r1x4_rewrite.sbatch). AFTER=<jobid> makes the first job wait for it.
+# NAME, RUN_ARGS, OVERRIDES, MARGIN_MIN, PYENV, DATA, P_TEACHER, CHES, MC_SAMPLES, DELTA_V, ABORT_VAL_FRAC (see r1x4_rewrite.sbatch). AFTER=<jobid> makes the first job wait for it.
 set -euo pipefail
 
 usage() { sed -n '5p' "$0" | sed 's/^#   //' >&2; exit 2; }
@@ -24,7 +24,8 @@ esac
 HERE=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
 export PROFILE STEPS=${STEPS:-260} OPTIM=${OPTIM:-muon}
 export KIT=${KIT:-$(cd "$HERE/../.." && pwd)} ROOT=${ROOT:-/scratch.global/radke149/r1x4_runs}
-for f in "$ROOT/data/rewrite_pairs_qwen3-0.6b.parquet" "$ROOT/data/valid.parquet"; do
+export DATA=${DATA:-$ROOT/data/rewrite_pairs_qwen3-0.6b.parquet}
+for f in "$DATA" "$ROOT/data/valid.parquet"; do
   [[ -f $f ]] || { echo "missing $f (copy the data first, see scripts/slurm/README.md)" >&2; exit 1; }
 done
 mkdir -p "$ROOT/logs"

@@ -22,6 +22,10 @@
 #   OVERRIDES  extra Hydra overrides, space-separated (e.g. "actor_rollout_ref.rollout.gpu_memory_utilization=0.4")
 #   MARGIN_MIN minutes kept free before the Slurm end time (15)
 #   PYENV      python env prefix (/scratch.global/radke149/envs/ampo: torch 2.6 / vLLM 0.8.5)
+#   DATA       training parquet ($ROOT/data/rewrite_pairs_qwen3-0.6b.parquet)
+#   P_TEACHER  --p_teacher percent, needs wrong_teacher_logps in DATA (0)     CHES        --ches (yes)
+#   MC_SAMPLES --mc_samples; 0 = skip exactly the prompts whose 4 students are all correct (4)
+#   DELTA_V    --delta_v AsymRE baseline shift (0)    ABORT_VAL_FRAC  --abort_val_frac; the trainer writes $CKPT/ABORTED (0)
 # Exit: 0 after a finished run or a deadline stop; run.py's code after a crash. Last line: R1X4_DONE or R1X4_RESUMABLE.
 set -euo pipefail
 
@@ -32,6 +36,8 @@ KIT=${KIT:-/scratch.global/radke149/r1x4kit_1p7b_4b}
 ROOT=${ROOT:-/scratch.global/radke149/r1x4_runs}
 MARGIN_MIN=${MARGIN_MIN:-15}
 PYENV=${PYENV:-/scratch.global/radke149/envs/ampo}
+DATA=${DATA:-$ROOT/data/rewrite_pairs_qwen3-0.6b.parquet}
+P_TEACHER=${P_TEACHER:-0} CHES=${CHES:-yes} MC_SAMPLES=${MC_SAMPLES:-4} DELTA_V=${DELTA_V:-0} ABORT_VAL_FRAC=${ABORT_VAL_FRAC:-0}
 JOB=${SLURM_JOB_ID:-local$$}
 
 export HF_HOME=${HF_HOME:-/scratch.global/radke149/hf-cache} HF_HUB_OFFLINE=1 TOKENIZERS_PARALLELISM=false
@@ -119,9 +125,10 @@ read -r -a RA <<< "${RUN_ARGS:-}"
 read -r -a OV <<< "${OVERRIDES:-}"
 NCPU=${SLURM_CPUS_PER_TASK:-$(nproc)}
 RAY_CPUS=$(( NCPU > 4 ? NCPU - 2 : 2 ))
-ARGS=(--model qwen3-0.6b --data "$ROOT/data/rewrite_pairs_qwen3-0.6b.parquet" --val "$ROOT/data/valid.parquet"
-      --p 1 --p_rows neg --ches yes --ranking yes --rank_score gold --rank_rolling yes --rank_pool 1000 --rank_top 100
-      --batch 100 --rlplus yes --rlplus_warmup 10 --rlplus_cbar 1.0 --mc_skip yes --mc_samples 4 --mc_z 1.0
+ARGS=(--model qwen3-0.6b --data "$DATA" --val "$ROOT/data/valid.parquet"
+      --p 1 --p_rows neg --p_teacher "$P_TEACHER" --ches "$CHES" --ranking yes --rank_score gold --rank_rolling yes --rank_pool 1000 --rank_top 100
+      --batch 100 --rlplus yes --rlplus_warmup 10 --rlplus_cbar 1.0 --mc_skip yes --mc_samples "$MC_SAMPLES" --mc_z 1.0
+      --delta_v "$DELTA_V" --abort_val_frac "$ABORT_VAL_FRAC"
       ${OPT[@]+"${OPT[@]}"} --entropy 0 --steps "$STEPS" --gpus "$GPUS" --hw "$HW" --test_freq 20 --save_freq 5
       --keep_ckpt 2 --root "$ROOT" --resume auto --logger '["console","tensorboard"]'
       ${RA[@]+"${RA[@]}"})
@@ -135,6 +142,9 @@ CKPT=$ROOT/ckpt/$NAME
 latest() { local n=; [[ -s $CKPT/latest_checkpointed_iteration.txt ]] && n=$(tr -dc '0-9' < "$CKPT/latest_checkpointed_iteration.txt"); echo "${n:-0}"; }
 echo "experiment $NAME  hw=$HW gpus=$GPUS ray_cpus=$RAY_CPUS  ckpt $CKPT (latest step $(latest))"
 
+if [[ -f $CKPT/ABORTED ]]; then
+  echo "R1X4_DONE $NAME aborted earlier ($(cat "$CKPT/ABORTED")), validation fell below the abort threshold"; exit 0
+fi
 n=$(latest)
 if (( n >= STEPS )); then
   echo "R1X4_DONE $NAME step $n >= $STEPS (nothing to run)"; exit 0
@@ -160,6 +170,9 @@ n=$(latest)
 echo "run.py exit $rc; deadline stop $deadline_stop; latest checkpoint step $n / $STEPS; log $log"
 if (( n >= STEPS )); then
   echo "R1X4_DONE $NAME step $n"; exit 0
+fi
+if [[ -f $CKPT/ABORTED ]]; then
+  echo "R1X4_DONE $NAME aborted ($(cat "$CKPT/ABORTED")), validation fell below the abort threshold"; exit 0
 fi
 if (( rc != 0 && ! deadline_stop )); then
   [[ -n $log ]] && tail -n 40 "$log"

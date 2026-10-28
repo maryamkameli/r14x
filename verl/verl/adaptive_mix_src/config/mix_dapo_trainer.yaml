@@ -200,6 +200,8 @@ r1x4:  # used only by verl.r1x4.main_r1x4
   layout: r1x4                    # r1x4 = 4 students + 4 teachers filled to exactly 4C/4W | append = 4 students + k_teacher positive rows
   k_teacher: 2                    # teacher rows per prompt in the append layout (uniform over the prompt's correct traces)
   baseline: group                 # group = mean of all rows (R1x4: pinned 0.5) | student = mean of the 4 student rows (Dr.GRPO)
+  delta_v: 0.0                    # AsymRE (arXiv 2506.20520) baseline shift, in 0/1 reward units: advantage = r - (base + delta_v)
+  abort_val_frac: 0.0             # stop when val/avg_score < this x the step-0 val/avg_score (0 = never)
   anneal:                         # variant IV: teacher rows x lambda_t, cosine to 0 at T_a, then pure GRPO-4
     enable: False
     frac: 0.2                     # T_a = round(frac * total_training_steps)

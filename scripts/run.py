@@ -73,6 +73,9 @@ ap.add_argument('--hold_steps', type=int, default=0)
 ap.add_argument('--lambda_min', type=float, default=0.0)
 ap.add_argument('--neg_weight', type=float, default=1.0, help='multiplier for wrong teacher rows (0 drops them)')
 ap.add_argument('--entropy', type=float, default=0.001, help='entropy bonus coefficient')
+ap.add_argument('--delta_v', type=float, default=0.0,
+                help='AsymRE baseline shift in 0/1 reward units (advantage = r - (base + delta_v)); -0.05 = the paper\'s -0.1 on +-1 rewards')
+ap.add_argument('--abort_val_frac', type=float, default=0.0, help='stop once val/avg_score < this x the step-0 value (0 = never)')
 ap.add_argument('--entropy_student_only', type=yes, default=False)
 ap.add_argument('--is_logratio_min', type=float, default=-20.0)
 ap.add_argument('--lambda0', type=float, default=1.0)
@@ -139,7 +142,7 @@ name = a.name or '-'.join(['R1X4', dset, m['tag'], f'P{a.p:g}PCT' if a.p > 0 els
                           + (['ISTRUNC'] if a.isamp else []) + ([f'ANNEAL{a.anneal_frac:g}'] if a.anneal else [])
                           + ([f'APPEND{a.k_teacher}POS'] if a.layout == 'append' else []) + (['STUDENTBASE'] if a.baseline == 'student' else [])
                           + ([a.schedule.upper()] if a.anneal and a.schedule != 'cosine' else []) + ([f'HOLD{a.hold_steps}'] if a.hold_steps else [])
-                          + ([f'NEGW{a.neg_weight:g}'] if a.neg_weight != 1 else []) + ([f'PT{a.p_teacher:g}PCT'] if a.p_teacher > 0 else []) + (['NEG1MP'] if a.neg_one_minus_p else []) + ([f'ENT{a.entropy:g}'] if a.entropy != 0.001 else [])
+                          + ([f'NEGW{a.neg_weight:g}'] if a.neg_weight != 1 else []) + ([f'PT{a.p_teacher:g}PCT'] if a.p_teacher > 0 else []) + (['NEG1MP'] if a.neg_one_minus_p else []) + ([f'DV{a.delta_v:g}'] if a.delta_v else []) + ([f'ENT{a.entropy:g}'] if a.entropy != 0.001 else [])
                           + (['ENTSTUDENTONLY'] if a.entropy_student_only else []) + ([f'LENREF{a.len_ref:g}'] if a.len_ref > 0 else [])
                           + (['GATEALLFAIL'] if a.gate == 'all_fail' else []) + ([f'LAMBDA0{a.lambda0:g}'] if a.lambda0 != 1 else [])
                           + ([f'RLPLUS{a.rlplus_warmup}'] if a.rlplus else []) + ([f'MCSKIP{a.mc_samples}'] if a.mc_skip else [])
@@ -201,7 +204,7 @@ ov = [
     f'r1x4.anneal.gate={a.gate}', f'r1x4.anneal.len_ref={a.len_ref}', f'r1x4.anneal.reset_adam={not a.no_reset_adam}',
     f'r1x4.anneal.diag_every={a.diag_every}', f'r1x4.anneal.schedule={a.schedule}', f'r1x4.anneal.hold_steps={a.hold_steps}',
     f'r1x4.anneal.lambda_min={a.lambda_min}', f'r1x4.anneal.neg_weight={a.neg_weight}',
-    f'r1x4.layout={a.layout}', f'r1x4.k_teacher={a.k_teacher}', f'r1x4.baseline={a.baseline}', f'r1x4.isamp.enable={a.isamp}',
+    f'r1x4.delta_v={a.delta_v}', f'r1x4.abort_val_frac={a.abort_val_frac}', f'r1x4.layout={a.layout}', f'r1x4.k_teacher={a.k_teacher}', f'r1x4.baseline={a.baseline}', f'r1x4.isamp.enable={a.isamp}',
     # the truncated-IS loss clips at actor.is_cbar: the RL-PLUS clip when --rlplus, else variant IV's c-bar
     f'actor_rollout_ref.actor.is_cbar={a.rlplus_cbar if a.rlplus else a.is_cbar}', f'r1x4.isamp.cbar={a.is_cbar}',
     f'r1x4.rank.rolling={a.rank_rolling}',
