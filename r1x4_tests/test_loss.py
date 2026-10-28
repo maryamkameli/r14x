@@ -60,6 +60,23 @@ assert torch.equal((g4 == 0) & (g1n != 0), low_t), 'teacher p-drop must zero exa
 assert torch.equal(g4[~low_t], g1n[~low_t]), 'all other tokens unchanged'
 assert abs(float(o4['teacher_gen_lowp_drop_frac']) - float(low_t.sum() / neg_t.sum())) < 1e-6
 print('teacher p-drop ok: dropped', int(low_t.sum()), 'of', int(neg_t.sum()), 'negative teacher tokens')
+# outside-support drop: teacher tokens stored at -1e4 (= -inf, outside the generator's sampling support) lose their
+# gradient on positive AND negative teacher rows; student rows and in-support teacher tokens are unchanged
+tgo = tgl.clone()
+tgo[(torch.rand(B, L) < 0.2) & pre] = -1e4
+out_t = pre & eos.bool() & (tgo < -1e3)
+def grad3(**kw):
+    lp.grad = None
+    out = F(olp, lp, adv, eos, pre, config=cfg(**kw), teacher_gen_logp=tgo)
+    out['pg_loss'].backward()
+    return lp.grad.clone(), out
+g5, o5 = grad3(teacher_drop_outside_support=True)
+g5b, _ = grad3()
+assert (out_t & (adv.sum(-1, keepdim=True) > 0)).any() and (out_t & (adv.sum(-1, keepdim=True) < 0)).any(), 'test needs both kinds'
+assert torch.equal((g5 == 0) & (g5b != 0), out_t), 'support drop must zero exactly the out-of-support teacher tokens, pos and neg rows'
+assert torch.equal(g5[~out_t], g5b[~out_t]), 'all other tokens unchanged'
+assert abs(float(o5['teacher_out_support_drop_frac']) - float(out_t.sum() / (pre & eos.bool()).sum())) < 1e-6
+print('support drop ok: dropped', int(out_t.sum()), 'of', int((pre & eos.bool()).sum()), 'teacher tokens (pos + neg rows)')
 # 1 - p weight: every token of a negative row (teacher AND student) x (1 - sg(p_old)); positive rows unchanged
 g5, o5 = grad2(teacher_token_min_prob=0.01, teacher_token_min_prob_rows='neg', teacher_token_min_teacher_prob=0.01,
                neg_one_minus_p=True)

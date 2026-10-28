@@ -305,7 +305,8 @@ class MIXRayDAPOTrainer(RayPPOTrainer):
             actor_rollout_cls = RayClassWithInitArgs(
                 cls=self.role_worker_mapping[Role.ActorRollout],
                 config=self.config.actor_rollout_ref,
-                role="actor_rollout",
+                # R1x4 RL-PLUS refresh: a reference copy in the same worker, synced from the actor every n steps
+                role="actor_rollout_ref" if self.config.actor_rollout_ref.ref.get("in_actor_worker", False) else "actor_rollout",
                 # profile_option=self.config.trainer.npu_profile.options,
             )
             self.resource_pool_to_cls[resource_pool]['actor_rollout'] = actor_rollout_cls

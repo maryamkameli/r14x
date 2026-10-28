@@ -295,6 +295,7 @@ def compute_token_on_off_policy_loss(
     # r1x4: drop (not renormalize) tokens. Under loss_remove_token_mean the normalizer is the constant
     # response length, so dropped tokens leave and the rest keep their weight.
     teacher_lowp_drop_frac = ches_drop_frac = teacher_gen_lowp_drop_frac = neg_weight_mean = None
+    teacher_out_support_drop_frac = None
     min_p = config.get("teacher_token_min_prob", 0.0) or 0.0
     if min_p > 0:  # teacher tokens the PRE-UPDATE policy finds unlikely (p_old < min_p) lose their gradient
         tok_t = prefix_mask.bool() & eos_mask.bool()
@@ -314,6 +315,13 @@ def compute_token_on_off_policy_loss(
         low_t = tok_n & (teacher_gen_logp.float() < math.log(min_pt))
         pg_losses = pg_losses * (~low_t).to(pg_losses.dtype)
         teacher_gen_lowp_drop_frac = low_t.sum().float() / torch.clamp(tok_n.sum().float(), min=1.0)
+    if config.get("teacher_drop_outside_support", False) and teacher_gen_logp is not None:
+        # r1x4 (Ivan 2026-10-28): tokens outside the generating teacher's sampling support (stored -inf -> -1e4) lose
+        # their gradient on EVERY teacher row, positive or negative (0 = no value -> never dropped)
+        tok_a = prefix_mask.bool() & eos_mask.bool()
+        out_t = tok_a & (teacher_gen_logp.float() < -1e3)
+        pg_losses = pg_losses * (~out_t).to(pg_losses.dtype)
+        teacher_out_support_drop_frac = out_t.sum().float() / torch.clamp(tok_a.sum().float(), min=1.0)
     if config.get("neg_one_minus_p", False):
         # r1x4 (Ivan 2026-10-27): every token of a NEGATIVE row (teacher or student) is weighted by 1 - sg(p_old), so
         # tokens the student already finds likely are pushed down little and its existing knowledge is kept
@@ -354,6 +362,7 @@ def compute_token_on_off_policy_loss(
         **({"teacher_lowp_drop_frac": teacher_lowp_drop_frac} if teacher_lowp_drop_frac is not None else {}),
         **({"ches_drop_frac": ches_drop_frac} if ches_drop_frac is not None else {}),
         **({"teacher_gen_lowp_drop_frac": teacher_gen_lowp_drop_frac} if teacher_gen_lowp_drop_frac is not None else {}),
+        **({"teacher_out_support_drop_frac": teacher_out_support_drop_frac} if teacher_out_support_drop_frac is not None else {}),
         **({"neg_weight_mean": neg_weight_mean} if neg_weight_mean is not None else {}),
     }
 @register_policy_loss("mixed_seq_off_policy_loss")

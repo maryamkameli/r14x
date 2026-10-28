@@ -60,6 +60,9 @@ ap.add_argument('--p_rows', default='all', choices=['all', 'pos', 'neg'])
 ap.add_argument('--p_teacher', type=float, default=0,
                 help='percent: wrong-teacher tokens with p < this under the GENERATING teacher are dropped too (needs '
                      'wrong_teacher_logps in --data); 0 disables')
+ap.add_argument('--teacher_support_drop', type=yes, default=False,
+                help='drop every teacher token (correct and wrong rows) outside the generator\'s sampling support (needs '
+                     'correct_teacher_logps and wrong_teacher_logps in --data)')
 ap.add_argument('--neg_one_minus_p', type=yes, default=False,
                 help='weight every token of a negative row (teacher or student) by 1 - sg(p_old)')
 ap.add_argument('--is', dest='isamp', type=yes, default=False, help='variant IV: truncated per-token IS on self-sampled correct teacher traces')
@@ -92,7 +95,12 @@ ap.add_argument('--rank_score', default='sum', choices=['sum', 'min', 'pos', 'ne
 ap.add_argument('--rank_rolling', type=yes, default=False, help='rolling pool: unpicked prompts stay; pool topped up to --rank_pool each round')
 ap.add_argument('--rlplus', type=yes, default=False, help='RL-PLUS ratio pi/(0.75 pi_old + 0.25/V) on teacher tokens, clipped at --rlplus_cbar')
 ap.add_argument('--rlplus_warmup', type=int, default=10, help='steps with ratio pi/pi_old (no IS) before RL-PLUS starts')
-ap.add_argument('--rlplus_cbar', type=float, default=1.0)
+ap.add_argument('--rlplus_cbar', type=float, default=1.0, help='clip of the RL-PLUS ratio (e.g. 1e9 = no clip)')
+ap.add_argument('--rlplus_refresh', type=int, default=0,
+                help='teacher denom: refresh the reference student every n steps (live copy in the actor worker); 0 = initial student')
+ap.add_argument('--rlplus_denom', default='paper', choices=['paper', 'teacher'],
+                help="paper: pi/(0.75 pi_old + 0.25/V); teacher: 2 pi/(pi_student0 + pi_teacher) from the stored initial-student "
+                     "and generating-teacher log-probs (clean_and_score.py columns)")
 ap.add_argument('--mc_skip', type=yes, default=False, help='skip prompts at the solved fixed point, checked with --mc_samples extra rollouts')
 ap.add_argument('--mc_samples', type=int, default=4)
 ap.add_argument('--mc_z', type=float, default=1.0)
@@ -142,10 +150,10 @@ name = a.name or '-'.join(['R1X4', dset, m['tag'], f'P{a.p:g}PCT' if a.p > 0 els
                           + (['ISTRUNC'] if a.isamp else []) + ([f'ANNEAL{a.anneal_frac:g}'] if a.anneal else [])
                           + ([f'APPEND{a.k_teacher}POS'] if a.layout == 'append' else []) + (['STUDENTBASE'] if a.baseline == 'student' else [])
                           + ([a.schedule.upper()] if a.anneal and a.schedule != 'cosine' else []) + ([f'HOLD{a.hold_steps}'] if a.hold_steps else [])
-                          + ([f'NEGW{a.neg_weight:g}'] if a.neg_weight != 1 else []) + ([f'PT{a.p_teacher:g}PCT'] if a.p_teacher > 0 else []) + (['NEG1MP'] if a.neg_one_minus_p else []) + ([f'DV{a.delta_v:g}'] if a.delta_v else []) + ([f'ENT{a.entropy:g}'] if a.entropy != 0.001 else [])
+                          + ([f'NEGW{a.neg_weight:g}'] if a.neg_weight != 1 else []) + ([f'PT{a.p_teacher:g}PCT'] if a.p_teacher > 0 else []) + (['TSUPP'] if a.teacher_support_drop else []) + (['NEG1MP'] if a.neg_one_minus_p else []) + ([f'DV{a.delta_v:g}'] if a.delta_v else []) + ([f'ENT{a.entropy:g}'] if a.entropy != 0.001 else [])
                           + (['ENTSTUDENTONLY'] if a.entropy_student_only else []) + ([f'LENREF{a.len_ref:g}'] if a.len_ref > 0 else [])
                           + (['GATEALLFAIL'] if a.gate == 'all_fail' else []) + ([f'LAMBDA0{a.lambda0:g}'] if a.lambda0 != 1 else [])
-                          + ([f'RLPLUS{a.rlplus_warmup}'] if a.rlplus else []) + ([f'MCSKIP{a.mc_samples}'] if a.mc_skip else [])
+                          + ([f'RLPLUS{a.rlplus_warmup}' + ('T' if a.rlplus_denom == 'teacher' else '') + (f'R{a.rlplus_refresh}' if a.rlplus_refresh else '') + ('NOCLIP' if a.rlplus_cbar >= 1e6 else f'CB{a.rlplus_cbar:g}' if a.rlplus_cbar != 1 else '')] if a.rlplus else []) + ([f'MCSKIP{a.mc_samples}'] if a.mc_skip else [])
                           + ([f'LOGRA{a.logra_rank}'] if a.logra else []) + (['MUON'] if a.muon else []))
 assert not (a.logra and a.muon), '--logra and --muon are mutually exclusive'
 ckpt, logs = os.path.join(a.root, 'ckpt', name), os.path.join(a.root, 'logs')
@@ -184,7 +192,7 @@ ov = [
     'actor_rollout_ref.actor.loss_row_mean_fix=True',
     f'actor_rollout_ref.actor.teacher_token_min_prob={a.p / 100.0}', f'actor_rollout_ref.actor.teacher_token_min_prob_rows={a.p_rows}',
     f'actor_rollout_ref.actor.teacher_token_min_teacher_prob={a.p_teacher / 100.0}',
-    f'actor_rollout_ref.actor.neg_one_minus_p={a.neg_one_minus_p}',
+    f'actor_rollout_ref.actor.neg_one_minus_p={a.neg_one_minus_p}', f'actor_rollout_ref.actor.teacher_drop_outside_support={a.teacher_support_drop}',
     f'actor_rollout_ref.actor.checkpoint.save_contents=[{a.ckpt_contents}]',
     'actor_rollout_ref.ref.use_ref=False',
     # rollout
@@ -208,7 +216,8 @@ ov = [
     # the truncated-IS loss clips at actor.is_cbar: the RL-PLUS clip when --rlplus, else variant IV's c-bar
     f'actor_rollout_ref.actor.is_cbar={a.rlplus_cbar if a.rlplus else a.is_cbar}', f'r1x4.isamp.cbar={a.is_cbar}',
     f'r1x4.rank.rolling={a.rank_rolling}',
-    f'r1x4.rlplus.enable={a.rlplus}', f'r1x4.rlplus.warmup_steps={a.rlplus_warmup}', f'r1x4.rlplus.cbar={a.rlplus_cbar}',
+    f'r1x4.rlplus.enable={a.rlplus}', f'r1x4.rlplus.warmup_steps={a.rlplus_warmup}', f'r1x4.rlplus.cbar={a.rlplus_cbar}', f'r1x4.rlplus.denom={a.rlplus_denom}', f'r1x4.rlplus.refresh_every={a.rlplus_refresh}',
+    f'actor_rollout_ref.ref.in_actor_worker={a.rlplus and a.rlplus_denom == "teacher" and a.rlplus_refresh > 0}',
     f'r1x4.mc_skip.enable={a.mc_skip}', f'r1x4.mc_skip.samples={a.mc_samples}', f'r1x4.mc_skip.z={a.mc_z}',
     f'r1x4.logra.enable={a.logra}', f'r1x4.logra.rank={a.logra_rank}', f'r1x4.logra.refresh={a.logra_refresh}',
     f'r1x4.logra.optimizer={a.logra_optimizer}', f'r1x4.logra.kl_budget_start={a.logra_kl_start}', f'r1x4.logra.kl_budget_end={a.logra_kl_end}',

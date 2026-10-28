@@ -881,6 +881,17 @@ class MIXActorRolloutRefWorker(Worker, DistProfilerExtension):
         
         return output
 
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def sync_ref_from_actor(self):
+        """R1x4 RL-PLUS refresh: reference weights := the current actor weights (full state dict on every rank, then
+        re-sharded into the reference FSDP module; dtype cast by load)."""
+        from torch.distributed.checkpoint.state_dict import StateDictOptions, get_model_state_dict, set_model_state_dict
+        assert self._is_actor and self._is_ref, 'sync_ref_from_actor needs role actor_rollout_ref'
+        sd = get_model_state_dict(self.actor_module_fsdp, options=StateDictOptions(full_state_dict=True))
+        set_model_state_dict(self.ref_module_fsdp, sd, options=StateDictOptions(full_state_dict=True))
+        del sd
+        torch.cuda.empty_cache()
+
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="actor"))
     @DistProfiler.annotate(color="olive", role="ref_compute_log_prob")
     def compute_ref_log_prob(self, data: DataProto):

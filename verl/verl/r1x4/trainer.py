@@ -108,10 +108,11 @@ class Curriculum:
 
 
 class R1x4Data:
-    def __init__(self, path, tokenizer, max_prompt_length, max_response_length, teacher_eos):
-        # the clean_and_score.py columns of student token ids / log-probs are not used here: not loaded (memory)
-        cols = [c for c in pq.read_schema(path).names if c not in ('correct_token_ids', 'correct_token_logps',
-                                                                   'wrong_token_ids', 'wrong_token_logps')]
+    def __init__(self, path, tokenizer, max_prompt_length, max_response_length, teacher_eos, keep_logps=False):
+        # clean_and_score.py columns: the token ids are never used here, the per-token log-probs only by the RL-PLUS
+        # 'teacher' denominator (keep_logps); unused columns are not loaded (memory)
+        drop = ('correct_token_ids', 'wrong_token_ids') + (() if keep_logps else ('correct_token_logps', 'wrong_token_logps'))
+        cols = [c for c in pq.read_schema(path).names if c not in drop]
         t = pq.read_table(path, columns=cols)
         self.rows = t.to_pylist()
         assert all(a['visit'] <= b['visit'] for a, b in zip(self.rows, self.rows[1:])), 'rows must be sorted by LUFFY visit'
@@ -173,7 +174,16 @@ class R1x4Trainer(MIXRayDAPOTrainer):
         c, d = self.config, self.config.data
         eos = self.config.r1x4.get('teacher_eos_token', None)
         eos_id = self.tokenizer.convert_tokens_to_ids(eos) if eos else self.tokenizer.eos_token_id
-        self.data = R1x4Data(d.train_files, self.tokenizer, d.max_prompt_length, d.max_response_length, eos_id)
+        rp = self.config.r1x4.get('rlplus')  # (called from the base __init__, before self.rc exists)
+        rp = rp if (rp and rp.get('enable', False)) else None
+        keep = rp is not None and rp.get('denom', 'paper') == 'teacher'
+        if keep and int(rp.get('refresh_every', 0) or 0) > 0:
+            assert self.config.actor_rollout_ref.ref.get('in_actor_worker', False), 'rlplus.refresh_every needs ref.in_actor_worker'
+        self.data = R1x4Data(d.train_files, self.tokenizer, d.max_prompt_length, d.max_response_length, eos_id, keep_logps=keep)
+        if keep:
+            r0 = self.data.rows[0]
+            assert all(k in r0 for k in ('correct_token_logps', 'wrong_token_logps', 'correct_teacher_logps', 'wrong_teacher_logps')), \
+                "rlplus.denom=teacher needs clean_and_score.py's student and teacher log-prob columns in --data"
         rk = self.config.r1x4.rank
         self.cur = Curriculum(len(self.data), rk.pool, rk.top, self.config.r1x4.retire_after_all_correct)
         self.train_dataloader = _CurriculumState(self.cur)
@@ -370,6 +380,19 @@ class R1x4Trainer(MIXRayDAPOTrainer):
     def _next_rows(self, batch_size, metrics, timing):
         self._refill(batch_size, metrics, timing)
         rows, self.cur.queue = self.cur.queue[:batch_size], self.cur.queue[batch_size:]
+        # coverage (Ivan 2026-10-28): prompts the ranking keeps passing over. A rolling-pool row leaves the pool only when
+        # chosen, so the never-trained rows the cursor has reached are exactly the pool rows not in `trained`
+        cur = self.cur
+        if not hasattr(cur, 'trained'):
+            cur.trained = set()
+        cur.trained.update(rows)
+        waiting = [i for i in getattr(cur, 'pool_rows', []) if i not in cur.trained]
+        frac = len(waiting) / max(cur.n, 1)
+        metrics.update({'pool/trained_frac': len(cur.trained) / max(cur.n, 1), 'pool/never_trained_waiting': len(waiting),
+                        'pool/never_trained_waiting_frac': frac,
+                        'pool/never_trained_passed_over_frac': sum(cur.age.get(i, 0) >= 1 for i in waiting) / max(cur.n, 1)})
+        if frac >= 0.08:
+            print(f'[r1x4] WARNING: {len(waiting)} prompts ({frac:.1%}) reached by the cursor were never trained', flush=True)
         return rows
 
     # ----------------------------------------------------------- CHES mask
@@ -470,7 +493,8 @@ class R1x4Trainer(MIXRayDAPOTrainer):
             teacher_on = lam > 0
             T = (TEACHERS if layout == 'r1x4' else K_app) if teacher_on else 0
             G = STUDENTS + T
-            plan, t_mu, t_kind, t_gen = [], [], [], []  # t_gen: generating-teacher log-probs of wrong rows (or None)
+            plan, t_mu, t_kind, t_gen = [], [], [], []  # t_gen: generating-teacher log-probs per teacher row (or None)
+            t_s0, t_tch = [], []  # per teacher row: stored initial-student / generating-teacher log-probs (RL-PLUS 'teacher')
             if teacher_on:
                 t_rows, t_resp = [], []
                 for p, i in enumerate(rows):
@@ -487,7 +511,8 @@ class R1x4Trainer(MIXRayDAPOTrainer):
                         n_pos, wr = K_app, []
                         pos_pick = list(rng.choice(max(len(mu), 1), K_app, replace=len(mu) < K_app))
                     for c in pos_pick:
-                        t_rows.append(i), t_kind.append(1), t_gen.append(None)
+                        t_rows.append(i), t_kind.append(1), t_gen.append(None if mu else r.get('correct_teacher_logps'))
+                        t_s0.append(None if mu else r.get('correct_token_logps')), t_tch.append(None if mu else r.get('correct_teacher_logps'))
                         if mu:  # self-sampled correct trace with its log mu
                             ids, lps = mu[c % len(mu)]
                             t_resp.append(ids[:self.data.R]), t_mu.append(lps[:self.data.R])
@@ -496,6 +521,8 @@ class R1x4Trainer(MIXRayDAPOTrainer):
                     for j in wr:
                         t_rows.append(i), t_resp.append(self.data.teacher_ids(i, r['wrong_texts'][j])), t_kind.append(0), t_mu.append(None)
                         t_gen.append(r['wrong_teacher_logps'][j] if 'wrong_teacher_logps' in r else None)
+                        t_s0.append(r['wrong_token_logps'][j] if 'wrong_token_logps' in r else None)
+                        t_tch.append(r['wrong_teacher_logps'][j] if 'wrong_teacher_logps' in r else None)
                     plan.append(len(wr))
                 tb = self._rows_proto(t_rows, t_resp)
                 tb.non_tensor_batch['reward_model'] = np.array([self.data.rows[i]['reward_model'] for i in t_rows], dtype=object)
@@ -592,10 +619,13 @@ class R1x4Trainer(MIXRayDAPOTrainer):
                         row = (q // T) * G + q % T
                         tl[row, :len(lps)], tm[row, :len(lps)] = lps, True
                 batch.batch['teacher_logp'], batch.batch['teacher_mu_mask'] = tl, tm & rmask.bool()
-            if teacher_on and float(self.config.actor_rollout_ref.actor.get('teacher_token_min_teacher_prob', 0.0)) > 0:
+            ac = self.config.actor_rollout_ref.actor
+            if teacher_on and (float(ac.get('teacher_token_min_teacher_prob', 0.0)) > 0 or ac.get('teacher_drop_outside_support', False)):
                 # generating-teacher log-prob per wrong-teacher token (clean_and_score.py wrong_teacher_logps, aligned with
                 # teacher_ids; -inf = outside the generator's sampling support, stored as -1e4); 0 elsewhere = p 1, never dropped
                 assert 'wrong_teacher_logps' in self.data.rows[rows[0]], '--p_teacher needs wrong_teacher_logps in --data'
+                assert not ac.get('teacher_drop_outside_support', False) or 'correct_teacher_logps' in self.data.rows[rows[0]], \
+                    '--teacher_support_drop needs correct_teacher_logps in --data'
                 tg = torch.zeros(len(batch), R)
                 for q, lps in enumerate(t_gen):
                     if lps is not None:
@@ -621,8 +651,50 @@ class R1x4Trainer(MIXRayDAPOTrainer):
                 warmup, cbar = int(rp.get('warmup_steps', 10)), float(rp.get('cbar', 1.0))
                 tok_t = batch.batch['prefix_mask'] & rmask.bool()
                 lp_old = batch.batch['old_log_probs'].float()
+                denom = rp.get('denom', 'paper')
                 if t <= warmup:
                     tlp = lp_old
+                elif denom == 'teacher':
+                    # Ivan 2026-10-28: eq. 4 with the KNOWN generating teacher and the INITIAL student (frozen):
+                    # r = 2 pi_theta / (pi_student0 + pi_teacher), i.e. teacher_logp = log((pi_student0 + pi_teacher) / 2).
+                    # Both stored per token by clean_and_score.py (student: training prompt, T=1; teacher: generation prompt,
+                    # sampling distribution, -inf outside its support). A row without them falls back to the paper's estimate.
+                    if not hasattr(self, '_vocab_size'):
+                        from transformers import AutoConfig
+                        mcfg = self.config.actor_rollout_ref.model
+                        self._vocab_size = int(AutoConfig.from_pretrained(
+                            mcfg.path, trust_remote_code=mcfg.get('trust_remote_code', False)).vocab_size)
+                    tlp = torch.logaddexp(lp_old + math.log(0.75), torch.full_like(lp_old, math.log(0.25 / self._vocab_size)))
+                    refresh = int(rp.get('refresh_every', 0) or 0)
+                    lp_ref = None
+                    if refresh > 0:  # Ivan 2026-10-28: pi_student_ref = a snapshot of the student, re-taken every `refresh` steps
+                        t0 = time.time()
+                        synced = getattr(self, '_ref_synced_at', None)
+                        if t > 1 and (synced is None or t - synced >= refresh):  # (step 1 / fresh start: ref = initial model)
+                            self.actor_rollout_wg.sync_ref_from_actor()
+                            self._ref_synced_at = synced = t
+                            print(f'[r1x4] RL-PLUS reference student refreshed at step {t}', flush=True)
+                        if synced is None:
+                            self._ref_synced_at = synced = 1
+                        tidx = torch.nonzero(is_teacher).squeeze(-1).tolist()  # teacher rows only (B*T, divisible by the GPUs)
+                        sub = batch.select(batch_keys=['prompts', 'responses', 'input_ids', 'attention_mask', 'position_ids']).select_idxs(tidx)
+                        lp_ref = torch.zeros(len(batch), R)
+                        lp_ref[tidx] = self._wg_call(self.actor_rollout_wg.compute_ref_log_prob, sub).batch['ref_log_prob'].float()
+                        metrics['rlplus/ref_age'] = t - synced
+                        timing['ref_log_prob'] = time.time() - t0
+                    s0 = torch.zeros(len(batch), R)
+                    for q, (a_, b_) in enumerate(zip(t_s0, t_tch)):
+                        if b_ is not None and (a_ is not None or lp_ref is not None):
+                            row = (q // T) * G + q % T
+                            n = min(len(b_), R, len(a_) if lp_ref is None else R)
+                            a_t = (torch.tensor(a_[:n]).float() if lp_ref is None else lp_ref[row, :n])
+                            b_t = torch.tensor(b_[:n]).float()
+                            tlp[row, :n] = torch.logaddexp(a_t, b_t) - math.log(2.0)  # -inf teacher -> log(pi_ref / 2)
+                            s0[row, :n] = a_t
+                    if t == 1 or t % 20 == 0:  # the stored initial student vs this step's pi_old (equal at step 1 up to bf16)
+                        d = (s0 - lp_old)[tok_t & (s0 != 0)]
+                        if d.numel():
+                            metrics['rlplus/s0_minus_old_abs_mean'] = float(d.abs().mean())
                 else:
                     vocab_size = getattr(self, '_vocab_size', None)
                     if vocab_size is None:

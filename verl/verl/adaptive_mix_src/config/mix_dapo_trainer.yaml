@@ -60,6 +60,7 @@ actor_rollout_ref:
     teacher_token_min_prob: 0.0       # r1x4: drop teacher tokens with pre-update p < this (0 = off)
     teacher_token_min_prob_rows: all  # all | pos | neg teacher rows
     teacher_token_min_teacher_prob: 0.0  # r1x4: drop negative-teacher tokens with generating-teacher p < this (0 = off)
+    teacher_drop_outside_support: False  # r1x4: drop every teacher token (pos and neg rows) outside the generator's sampling support
     neg_one_minus_p: False            # r1x4: every negative-row token (teacher or student) weighted by 1 - sg(p_old)
     loss_row_mean_fix: False          # True: per-row weight 1/(L*mini) also under dynamic bsz (AMPO default: off)
     is_cbar: 1.0                      # r1x4 variant IV: per-token IS ratio truncation c-bar
@@ -91,6 +92,7 @@ actor_rollout_ref:
     log_prob_max_token_len_per_gpu: ${actor_rollout_ref.actor.ppo_max_token_len_per_gpu}
     ulysses_sequence_parallel_size: ${actor_rollout_ref.actor.ulysses_sequence_parallel_size} # sp size
     use_ref: True
+    in_actor_worker: False  # R1x4 RL-PLUS refresh: build the ref model inside the actor_rollout worker (sync_ref_from_actor)
   rollout:
     name: vllm
     temperature: 1.0
@@ -223,6 +225,9 @@ r1x4:  # used only by verl.r1x4.main_r1x4
     enable: False
     warmup_steps: 10              # steps 1..warmup: ratio pi/pi_old (= 1, no IS); later: pi / (0.75 pi_old + 0.25/V)
     cbar: 1.0                     # clip of the ratio (the loss uses actor.is_cbar; keep both equal)
+    denom: paper                  # paper: pi / (0.75 pi_old + 0.25/V) | teacher: 2 pi / (pi_student_ref + pi_teacher), stored per token
+    refresh_every: 0              # teacher denom: 0 = pi_student_ref is the initial student (stored log-probs); n > 0 = a live
+                                  # reference copy synced from the actor every n steps (needs actor_rollout_ref.ref.in_actor_worker)
   mc_skip:                        # skip prompts at GRPO's fixed point (solved), checked with extra Monte Carlo samples
     enable: False
     samples: 4                    # extra rollouts per candidate prompt (graded only, never trained)
