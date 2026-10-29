@@ -61,3 +61,11 @@ checkpoints will be scored with one common eval.
 
 Main run at step 77/269 (~9-12 min/step), GRPO at 36/510 (~18 min/step), AMPO at 29/510 (~20 min/step).
 Baseline checkpoints are 7.3 GB each (last 3 kept).
+
+## Main run extended to 1500 steps (2026-10-29)
+
+Ivan: continue until at least 150k prompts (100 prompts/step -> 1500 steps, ~5.6 passes over the 26,801 problems).
+The first chain stopped cleanly at step 119 (deadline stop). Its remaining jobs were cancelled and the chain was resubmitted
+with the same command and `STEPS=1500` (same experiment name, so `--resume auto` continues from `global_step_119`; the
+dry run differs only in `trainer.total_training_steps`; LR is constant, so nothing else depends on the step count):
+`... STEPS=1500 ... scripts/slurm/submit_chain.sh a100x4 11 -t 24:00:00 -A interran`, jobs 5138136-5138148.
