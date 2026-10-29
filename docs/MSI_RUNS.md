@@ -43,3 +43,21 @@ Smoke tests of this recipe (1 L40S): `scripts/msi_smoke/smoke_msi.sbatch` (abort
 
 Official AMPO repo, AMPO and GRPO on Qwen3-0.6B: `baselines/ampo_official/README.md`.
 Started 2026-10-28: GRPO chain 5024031-5024040, AMPO chain 5024041-5024052.
+
+## Progress (2026-10-29 09:15 CDT)
+
+Validation average over the 5 sets (AIME, MATH, Olympiad, AMC, Minerva). The main run uses the LUFFY `\boxed{}` prompt and
+grader, the baselines use AMPO's `<answer>` prompt and grader, so the columns are not directly comparable; all final
+checkpoints will be scored with one common eval.
+
+| step | main run | GRPO | AMPO |
+|---|---|---|---|
+| 0  | 0.349 | 0.314 | 0.316 |
+| 10 | –     | 0.326 | 0.311 |
+| 20 | 0.348 | 0.333 | 0.296 |
+| 30 | –     | 0.335 | –     |
+| 40 | 0.343 | –     | –     |
+| 60 | 0.338 | –     | –     |
+
+Main run at step 77/269 (~9-12 min/step), GRPO at 36/510 (~18 min/step), AMPO at 29/510 (~20 min/step).
+Baseline checkpoints are 7.3 GB each (last 3 kept).
