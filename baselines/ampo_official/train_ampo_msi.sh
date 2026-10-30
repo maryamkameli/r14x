@@ -194,7 +194,7 @@ python3 -m verl.adaptive_mix_src.main_mix_dapo \
     trainer.nnodes="${NNODES}" \
     trainer.val_before_train=${VAL_BEFORE:-True} \
     trainer.test_freq=${TEST_FREQ:-10} \
-    trainer.save_freq=${SAVE_FREQ:-10} \
+    trainer.save_freq=${SAVE_FREQ:-5} \
     trainer.total_epochs=30 \
     trainer.total_training_steps=${STEPS:-510} \
     +trainer.max_optim_to_keep=2 \

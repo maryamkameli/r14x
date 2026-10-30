@@ -19,7 +19,7 @@ penalty), lr 1e-6, entropy 1e-3, 8,192-token responses, val every 10 steps and 5
 
 - model `Qwen/Qwen3-0.6B`; train file = AMPO's `openr1_math_4longcots.parquet` (8,491 prompts, `$R1X4_ROOT/data/ampo/`); val = the repo's `data/valid.parquet` (the same 2,019 problems as ours, in AMPO's `<answer>` prompt format)
 - console logging, wandb offline
-- `val_before_train=True` (step-0 score), `save_freq` 50 -> 10 and `max_actor_ckpt_to_keep=3` (24 h job limit, disk)
+- `val_before_train=True` (step-0 score), `save_freq` 50 -> 5 and `max_actor_ckpt_to_keep=3` (24 h job limit, disk)
 - speed only: no CPU offload, vLLM tensor parallel 1 (0.6B fits on one GPU), `ray_init.num_cpus=30`
 - `BSZ`, `MINI_BSZ`, `NGPUS`, `STEPS`, `TEST_FREQ`, `SAVE_FREQ`, `TEST_FILE`, `EXP_NAME`, `KEEP_CKPT` env overrides (defaults = the values above; the smoke test uses them)
 
