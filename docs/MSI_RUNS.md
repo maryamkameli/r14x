@@ -69,3 +69,11 @@ The first chain stopped cleanly at step 119 (deadline stop). Its remaining jobs 
 with the same command and `STEPS=1500` (same experiment name, so `--resume auto` continues from `global_step_119`; the
 dry run differs only in `trainer.total_training_steps`; LR is constant, so nothing else depends on the step count):
 `... STEPS=1500 ... scripts/slurm/submit_chain.sh a100x4 11 -t 24:00:00 -A interran`, jobs 5138136-5138148.
+
+## A100 or H100 (2026-10-30)
+
+All queued jobs (main run and both baselines) were switched in place with
+`scontrol update JobId=<id> Partition=a100-4,a100-8,msigpu Features="a100|h100" TresPerNode=gres/gpu:4`, so each 24 h job
+starts on whichever 4-GPU A100 or H100 node frees up first (V100 nodes excluded; queue position kept). The main run picks its
+`--hw` memory profile from the GPU memory (40 GB -> a100_40, 80 GB -> a100_80); `--hw` changes only memory knobs, not the recipe
+or the experiment name. New baseline jobs: `baselines/ampo_official/baseline.sbatch` requests the same.

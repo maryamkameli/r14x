@@ -1,14 +1,15 @@
 #!/bin/bash
 #SBATCH -N 1
 #SBATCH --ntasks=1
-#SBATCH -p a100-4
-#SBATCH --gres=gpu:a100:4
+#SBATCH -p a100-4,a100-8,msigpu
+#SBATCH --gres=gpu:4
+#SBATCH --constraint=a100|h100
 #SBATCH -c 32
 #SBATCH --mem=200g
 #SBATCH -t 24:00:00
 #SBATCH -o /scratch.global/kamel026/r1x4_runs/baselines/logs/%x_%j.out
 # One 24h link of a resumable chain running the official AMPO repo's train_${ALGO}.sh (ALGO=ampo|grpo) on Qwen3-0.6B,
-# 4xA100. trainer.resume_mode=auto picks up the latest checkpoint (saved every 10 steps); links after the end exit at once.
+# 4xA100 or 4xH100, whichever starts first. trainer.resume_mode=auto picks up the latest checkpoint (saved every 5 steps); links after the end exit at once.
 source /scratch.global/kamel026/r1x4_runs/baselines/env.sh
 ALGO=${ALGO:?set ALGO=ampo|grpo} STEPS=${STEPS:-510}
 NAME=Qwen3-0.6B-${ALGO^^}
