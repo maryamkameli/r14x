@@ -95,3 +95,9 @@ experiment names `Qwen3-0.6B-{GRPO,AMPO,LUFFY}-OURSDATA-V4`.
 `data/valid.parquet` (same problems, golds and order, `\boxed{}` prompt). AMPO and LUFFY had not started yet. GRPO
 (5283405, 4xA100 40GB, ~17 min/step) was stopped after its step-5 checkpoint and resumes from it in the next link with
 the correct val file; its step-0 val (AMPO prompt) is not comparable and is replaced by AMPO's/LUFFY's step-0 (same base model).
+
+## Decision point at step 400 (agreed with Ivan, 2026-10-31)
+
+The main run's val falls from 0.349 (step 0) to 0.329 (step 100). A dip is expected; the question is whether it rebounds.
+At step 400 (40k prompts, ~1.5 passes over the 26,801 problems): if val is still going down, rethink the method; if it is
+flat or going up, continue to step 1500.
