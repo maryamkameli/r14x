@@ -17,8 +17,8 @@ cd $AHOME/ampo/verl
 # very important! please modify the max_position_embeddings in config.json to 32768 after downloading from huggingface
 MODEL_PATH=Qwen/Qwen3-0.6B
 CKPTS_DIR="${ROOT}/r1x4_runs/baselines/ckpt/${exp_name}"
-TRAIN_FILE="${ROOT}/r1x4_runs/data/ampo/openr1_math_4longcots.parquet"
-TEST_FILE="${TEST_FILE:-${AHOME}/data/valid.parquet}"
+TRAIN_FILE="${TRAIN_FILE:-${ROOT}/r1x4_runs/data/baseline/train_ours_r1teacher.parquet}"  # our 26,801 problems + our prompt column; teacher = LUFFY R1 trace
+TEST_FILE="${TEST_FILE:-${ROOT}/r1x4_runs/data/valid.parquet}"  # our val file: the same 2,019 problems, golds and order as AMPO data/valid.parquet, with our \boxed{} system prompt
 
 adv_estimator=grpo
 
@@ -39,8 +39,8 @@ target_selection_strategy='best_k'
 prefix_strategy='random'
 
 # reward
-reward_impl_version=5
-val_reward_impl_version=5
+reward_impl_version=6  # R1x4 reward v4 (math_verify on the whole response), added to math_verify_reward.py
+val_reward_impl_version=6
 off_policy_reward_manager='naive'
 reward_manager='naive'
 val_reward_manager='naive'
@@ -48,7 +48,7 @@ val_reward_manager='naive'
 clip_ratio_low=0.2
 clip_ratio_high=0.2
 
-max_prompt_length=$((1024 * 1))
+max_prompt_length=1536  # as in our run (2 val prompts exceed 1024)
 max_response_length=$((1024 * 8))
 enable_overlong_buffer=False
 overlong_buffer_len=$((1024 * 4))
@@ -184,7 +184,7 @@ python3 -m verl.adaptive_mix_src.main_mix_dapo \
     reward_model.off_policy_reward_manager=${off_policy_reward_manager} \
     reward_model.val_reward_manager=${val_reward_manager} \
     reward_model.format_mode=R1_nothink \
-    reward_model.format_coefficient=0.1 \
+    reward_model.format_coefficient=0 \
     trainer.logger='["console"]' \
     trainer.project_name="${project_name}" \
     trainer.experiment_name="${exp_name}" \

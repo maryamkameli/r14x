@@ -41,8 +41,8 @@ Smoke tests of this recipe (1 L40S): `scripts/msi_smoke/smoke_msi.sbatch` (abort
 
 ## Baselines
 
-Official AMPO repo, AMPO and GRPO on Qwen3-0.6B: `baselines/ampo_official/README.md`.
-Started 2026-10-28: GRPO chain 5024031-5024040, AMPO chain 5024041-5024052.
+GRPO, AMPO and LUFFY in the official AMPO repo on Qwen3-0.6B: `baselines/ampo_official/README.md`.
+v1 (2026-10-28, AMPO's data/prompt/grader): GRPO chain 5024031-5024040, AMPO chain 5024041-5024052, superseded (see below).
 
 ## Progress (2026-10-29 09:15 CDT)
 
@@ -74,6 +74,24 @@ dry run differs only in `trainer.total_training_steps`; LR is constant, so nothi
 
 All queued jobs (main run and both baselines) were switched in place with
 `scontrol update JobId=<id> Partition=a100-4,a100-8,msigpu Features="a100|h100" TresPerNode=gres/gpu:4`, so each 24 h job
-starts on whichever 4-GPU A100 or H100 node frees up first (V100 nodes excluded; queue position kept). The main run picks its
+starts on whichever 4-GPU A100 or H100 node frees up first (V100 nodes excluded). Note: `scontrol update` resets
+the jobs' age priority (AccrueTime), so they lost their accumulated queue age. The main run picks its
 `--hw` memory profile from the GPU memory (40 GB -> a100_40, 80 GB -> a100_80); `--hw` changes only memory knobs, not the recipe
 or the experiment name. New baseline jobs: `baselines/ampo_official/baseline.sbatch` requests the same.
+
+## Baselines v2: our data, prompts and grader (2026-10-30)
+
+Ivan: every baseline must use exactly our prompts and math_verify v4, with no format reward. The v1 chains were cancelled
+(GRPO at step 70, val 0.362; AMPO at step 60, val ~0.298; checkpoints kept in `ckpt/Qwen3-0.6B-{GRPO,AMPO}`).
+v2 (`baselines/ampo_official/README.md`): our 26,801 problems and prompt column, R1 trace as teacher (4 copies for
+AMPO's 4 slots), reward v4 for train and val, `format_coefficient=0`, `max_prompt_length=1536`, and LUFFY added
+(LUFFY train.sh settings in the AMPO trainer). Smoke 5277855 (L40S): all three exit 0, format reward 0, LUFFY
+prefix ratio 1/8, AMPO 2-3/8.
+
+Chains (8 links each, ~510 steps = 65k prompts): GRPO 5283405-5283413, AMPO 5283414-5283422, LUFFY 5283424-5283431,
+experiment names `Qwen3-0.6B-{GRPO,AMPO,LUFFY}-OURSDATA-V4`.
+
+2026-10-31: the scripts' default val file was still AMPO's `data/valid.parquet` (`<answer>` prompt). It now points to our
+`data/valid.parquet` (same problems, golds and order, `\boxed{}` prompt). AMPO and LUFFY had not started yet. GRPO
+(5283405, 4xA100 40GB, ~17 min/step) was stopped after its step-5 checkpoint and resumes from it in the next link with
+the correct val file; its step-0 val (AMPO prompt) is not comparable and is replaced by AMPO's/LUFFY's step-0 (same base model).

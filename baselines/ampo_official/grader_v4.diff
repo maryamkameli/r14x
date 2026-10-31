@@ -1,0 +1,42 @@
+diff --git a/verl/verl/adaptive_mix_src/math_verify_reward.py b/verl/verl/adaptive_mix_src/math_verify_reward.py
+index 68b6524..8f6ab8c 100644
+--- a/verl/verl/adaptive_mix_src/math_verify_reward.py
++++ b/verl/verl/adaptive_mix_src/math_verify_reward.py
+@@ -42,6 +42,8 @@ def _select_rm_score_fn(data_source, reward_impl_version, phase='train'):
+             return reward_fn_math_verify
+         elif reward_impl_version == 4:
+             return reward_fn_math_verify_no_think
++        elif reward_impl_version == 6:
++            return reward_fn_math_verify_v4
+         elif reward_impl_version == 5:
+             if phase == 'train':
+                 return reward_fn_prime_math_train
+@@ -50,7 +52,7 @@ def _select_rm_score_fn(data_source, reward_impl_version, phase='train'):
+             else:
+                 raise NotImplementedError(f"phase {phase} not in the implementation")
+         else:
+-            raise NotImplementedError(f"reward_impl_version {reward_impl_version} not in the implementation, should be one of [0, 1, 2, 3, 4, 5]")
++            raise NotImplementedError(f"reward_impl_version {reward_impl_version} not in the implementation, should be one of [0, 1, 2, 3, 4, 5, 6]")
+ 
+ def extract_last_answer(text):
+     # Find all occurrences of <answer>...</answer>
+@@ -126,6 +128,19 @@ def reward_fn_math_verify_no_think(solution_str: str, ground_truth: Union[str, L
+     reward_response = reward_fn(RewardInput(problem=solution_str, problem_type=RewardType.MATH, model_response=solution_str, ground_truth={"answer": ground_truth}))
+     return reward_response.is_correct
+ 
++_ANSWER_TAG = re.compile(r'<answer>(.*?)</answer>', re.DOTALL)
++
++def reward_fn_math_verify_v4(solution_str: str, ground_truth: str):
++    """R1x4 reward v4 (r1x4kit verl/r1x4/reward.py grade_one), used for training and validation of every baseline:
++    math_verify(parse('$gold$'), parse(whole response)), 0/1, no format term. <answer>X</answer> is rewritten to
++    \\boxed{X} first so a tagged plain number is graded like a boxed one."""
++    text = _ANSWER_TAG.sub(lambda m: '\\boxed{' + m.group(1).strip() + '}', solution_str)
++    try:
++        g = parse('$' + str(ground_truth) + '$', parsing_timeout=5)
++        return float(bool(verify(g, parse(text, parsing_timeout=5), timeout_seconds=5)))
++    except Exception:
++        return 0.0
++
+ def reward_fn_prime_math_train(solution_str: str, ground_truth: str):
+     from verl.utils.reward_score.prime_math_train import compute_score
+     is_correct, extracted_model_output = compute_score(solution_str, ground_truth)
