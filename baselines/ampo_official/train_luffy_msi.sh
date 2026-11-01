@@ -17,6 +17,8 @@ cd $AHOME/ampo/verl
 # very important! please modify the max_position_embeddings in config.json to 32768 after downloading from huggingface
 MODEL_PATH=Qwen/Qwen3-0.6B
 CKPTS_DIR="${ROOT}/r1x4_runs/baselines/ckpt/${exp_name}"
+# a resumed job skips the validation at start (its checkpoint step is mid-chain; the next test_freq step validates)
+[[ -s ${CKPTS_DIR}/latest_checkpointed_iteration.txt ]] && VAL_BEFORE=${VAL_BEFORE:-False}
 TRAIN_FILE="${TRAIN_FILE:-${ROOT}/r1x4_runs/data/baseline/train_ours_r1teacher.parquet}"  # our 26,801 problems + our prompt column; teacher = LUFFY R1 trace
 TEST_FILE="${TEST_FILE:-${ROOT}/r1x4_runs/data/valid.parquet}"  # our val file: the same 2,019 problems, golds and order as AMPO data/valid.parquet, with our \boxed{} system prompt
 

@@ -26,7 +26,7 @@ is the algorithm:
 | `env.sh` | environment for every job: the r1x4 conda env, official AMPO verl first on `PYTHONPATH`, `stubs/`, `unset ROCR_VISIBLE_DEVICES` |
 | `stubs/sitecustomize.py` | placeholders for `vertexai`, `google-cloud-aiplatform`, `sentence_transformers`, imported at load time by `verl/deepscaler/utils.py` for an LLM grader that only runs with `use_math_orm=True` (never set) |
 | `smoke.sbatch` | 2 steps of each script on 1 L40S, 8 prompts, 32-row val (`make_valid32.py`) |
-| `baseline.sbatch`, `submit_chain.sh` | one 24 h link on 4xA100 or 4xH100, `resume_mode=auto`; `submit_chain.sh grpo|ampo|luffy [links]` queues the chain |
+| `baseline.sbatch`, `submit_chain.sh` | one 24 h link on 4 GPUs (A100, H100, or A40/L40S in `preempt-gpu`, whichever starts first), `resume_mode=auto`; `submit_chain.sh grpo|ampo|luffy [links]` queues the chain |
 
 ## AMPO teachers
 
@@ -49,7 +49,7 @@ Batch sizes (128 prompts x 8 rollouts, mini-batch 64), lr 1e-6, entropy 1e-3, 8,
 and 510 steps are unchanged.
 
 - model `Qwen/Qwen3-0.6B`; console logging, wandb offline
-- `val_before_train=True` (step-0 score), `save_freq` 50 -> 5 and `max_actor_ckpt_to_keep=3` (the trainer has no deadline
+- `val_before_train=True` (step-0 score) for a new run only; a job resuming from a checkpoint skips it, `save_freq` 50 -> 5 and `max_actor_ckpt_to_keep=3` (the trainer has no deadline
   stop, so a 24 h timeout loses the steps since the last save)
 - speed only: no CPU offload, vLLM tensor parallel 1 (0.6B fits on one GPU), `ray_init.num_cpus=30`
 - `BSZ`, `MINI_BSZ`, `NGPUS`, `STEPS`, `TEST_FREQ`, `SAVE_FREQ`, `TRAIN_FILE`, `TEST_FILE`, `EXP_NAME`, `KEEP_CKPT` env

@@ -101,3 +101,17 @@ the correct val file; its step-0 val (AMPO prompt) is not comparable and is repl
 The main run's val falls from 0.349 (step 0) to 0.329 (step 100). A dip is expected; the question is whether it rebounds.
 At step 400 (40k prompts, ~1.5 passes over the 26,801 problems): if val is still going down, rethink the method; if it is
 flat or going up, continue to step 1500.
+
+## A40/L40S nodes and no re-validation on resume (2026-11-01)
+
+The A100/H100 queues had ~1,900 pending jobs (a new 4-GPU job: estimated start ~34 h later), `preempt-gpu` (6x 8xA40, 5x 4xL40S,
+48 GB) ~140 (estimated start ~2 h). All 33 queued jobs (main run, GRPO, AMPO, LUFFY) were updated with
+`scontrol update JobId=<id> Partition=a100-4,a100-8,msigpu,preempt-gpu Features="a100|h100|a40|l40s"` (this resets their
+queue age). `preempt-gpu` jobs can be preempted by `interactive-gpu` users and are then requeued (PreemptMode=REQUEUE,
+JobRequeue=1); every run saves every 5 steps and resumes automatically, so a preemption loses at most 5 steps. On a 48 GB
+GPU the main run's a100x4 profile picks the `a100_40` memory settings (memory knobs only); the baselines' settings fit.
+Steps on A40/L40S are expected to be slower than on A100 (to be measured).
+
+Every job used to validate before its first step even when resuming (~30 min per 24 h job; AMPO re-scored step 60).
+`scripts/run.py` and the baseline `train_*_msi.sh` now skip that validation when a checkpoint exists; a new run still
+validates at step 0, and the next test_freq step validates as before.

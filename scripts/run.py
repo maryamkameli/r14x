@@ -164,6 +164,8 @@ assert a.layout == 'r1x4' or (B * (4 + a.k_teacher)) % a.gpus == 0, f'--batch {B
 assert a.layout == 'r1x4' or a.anneal, '--layout append is the IS+annealing recipe: use it with --anneal yes'
 rmpad = a.attn == 'flash_attention_2'
 
+# a resumed job skips the step-0 style validation: the checkpoint step was saved mid-chain, the next test_freq step validates
+resuming = a.resume == 'auto' and os.path.isfile(os.path.join(ckpt, 'latest_checkpointed_iteration.txt'))
 ov = [
     f'data.train_files={data}', f'data.val_files={val}', 'data.prompt_key=prompt', f'data.max_prompt_length={P}',
     f'data.max_response_length={R}', f'data.train_batch_size={B}', 'data.truncation=error', 'data.filter_overlong_prompts=False',
@@ -237,7 +239,7 @@ ov = [
     f'trainer.n_gpus_per_node={a.gpus}', 'trainer.nnodes=1', f'trainer.total_training_steps={a.steps}', 'trainer.total_epochs=1000',
     f'trainer.test_freq={a.test_freq}', f'trainer.save_freq={a.save_freq}', f'trainer.default_local_dir={ckpt}',
     f'trainer.resume_mode={a.resume}', f'+trainer.max_actor_ckpt_to_keep={a.keep_ckpt}',
-    f'trainer.val_before_train={not a.no_val_before_train}', 'trainer.balance_batch=False', 'trainer.critic_warmup=0',
+    f'trainer.val_before_train={not a.no_val_before_train and not resuming}', 'trainer.balance_batch=False', 'trainer.critic_warmup=0',
     'critic.enable=False',
     f'hydra.run.dir={os.path.join(a.root, "hydra", name, time.strftime("%m%d_%H%M%S"))}',
 ] + ([f'+trainer.rollout_data_dir={os.path.join(a.root, "rollouts", name)}'] if a.dump_rollouts else []) + a.overrides

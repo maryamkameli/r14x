@@ -1,9 +1,9 @@
 #!/bin/bash
 #SBATCH -N 1
 #SBATCH --ntasks=1
-#SBATCH -p a100-4,a100-8,msigpu
+#SBATCH -p a100-4,a100-8,msigpu,preempt-gpu
 #SBATCH --gres=gpu:4
-#SBATCH --constraint=a100|h100
+#SBATCH --constraint=a100|h100|a40|l40s
 #SBATCH -c 32
 #SBATCH --mem=200g
 #SBATCH -t 24:00:00
