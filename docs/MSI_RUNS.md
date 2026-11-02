@@ -123,3 +123,13 @@ step-140 validation at 22:11: `Watchdog caught collective operation timeout: Wor
 One rank finished its share of the 2,019 val prompts and waited > 10 min (the default `nccl_timeout`) for the others.
 Lost: steps 136-139 (the chain resumes from the step-135 save). `scripts/run.py` and the baseline `train_*_msi.sh` now pass
 `++actor_rollout_ref.nccl_timeout=3600`. Main-run val at step 120: 0.320.
+
+## Preemptions and MSI maintenance (2026-11-02)
+
+All three baselines were preempted on the A40 nodes on Nov 2 morning and requeued automatically (GRPO after 14 h at step 29,
+resumes from 25; AMPO after 2 h, before its first new save; LUFFY after 20.6 h, resumes from 30). Val so far: LUFFY 0.358 (0)
+-> 0.348 -> 0.344 -> 0.323 (30), i.e. LUFFY also dips; GRPO 0.345 (10) -> 0.360 (20); AMPO flat ~0.34 (0-60).
+
+MSI maintenance Wed Nov 4 05:00-17:00 (reservation root_2, all nodes): no 24 h job can start after Tue 05:00. All queued jobs got
+`scontrol update JobId=<id> TimeMin=02:00:00`, so Slurm may start them with a shorter limit that ends before the maintenance.
+The main run reads its actual end time and saves before it; a shortened baseline job loses the steps since its last 5-step save.
