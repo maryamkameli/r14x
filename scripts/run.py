@@ -241,6 +241,9 @@ ov = [
     f'trainer.resume_mode={a.resume}', f'+trainer.max_actor_ckpt_to_keep={a.keep_ckpt}',
     f'trainer.val_before_train={not a.no_val_before_train and not resuming}', 'trainer.balance_batch=False', 'trainer.critic_warmup=0',
     'critic.enable=False',
+    # a rank that finishes its share of a validation early waits for the others in a collective; on A40/L40S that wait
+    # exceeded the 10 min default (main run, step 140, val ~41 min)
+    '++actor_rollout_ref.nccl_timeout=3600',
     f'hydra.run.dir={os.path.join(a.root, "hydra", name, time.strftime("%m%d_%H%M%S"))}',
 ] + ([f'+trainer.rollout_data_dir={os.path.join(a.root, "rollouts", name)}'] if a.dump_rollouts else []) + a.overrides
 

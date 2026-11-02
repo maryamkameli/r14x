@@ -115,3 +115,11 @@ Steps on A40/L40S are expected to be slower than on A100 (to be measured).
 Every job used to validate before its first step even when resuming (~30 min per 24 h job; AMPO re-scored step 60).
 `scripts/run.py` and the baseline `train_*_msi.sh` now skip that validation when a checkpoint exists; a new run still
 validates at step 0, and the next test_freq step validates as before.
+
+## Main run crash at the step-140 validation (2026-11-01), NCCL timeout raised to 1 h
+
+Job 5138136 (4xA40, agc07) resumed at step 119, validated step 120 (0.320, ~41 min on A40 vs ~30 on A100) and crashed in the
+step-140 validation at 22:11: `Watchdog caught collective operation timeout: WorkNCCL(... ALLREDUCE ...) ran for 600037 ms`.
+One rank finished its share of the 2,019 val prompts and waited > 10 min (the default `nccl_timeout`) for the others.
+Lost: steps 136-139 (the chain resumes from the step-135 save). `scripts/run.py` and the baseline `train_*_msi.sh` now pass
+`++actor_rollout_ref.nccl_timeout=3600`. Main-run val at step 120: 0.320.

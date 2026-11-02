@@ -94,7 +94,15 @@
      algorithm.adv_estimator=${adv_estimator} \
      data.train_files="${TRAIN_FILE}" \
      data.val_files="${TEST_FILE}" \
-@@ -187,19 +188,21 @@
+@@ -132,6 +133,7 @@
+     actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=${infer_ppo_max_token_len} \
+     actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=${infer_ppo_max_token_len} \
+     actor_rollout_ref.rollout.name=vllm \
++    ++actor_rollout_ref.nccl_timeout=3600 \
+     actor_rollout_ref.model.path="${MODEL_PATH}" \
+     actor_rollout_ref.model.enable_gradient_checkpointing=True \
+     actor_rollout_ref.actor.optim.lr=1e-6 \
+@@ -187,19 +189,21 @@
      reward_model.off_policy_reward_manager=${off_policy_reward_manager} \
      reward_model.val_reward_manager=${val_reward_manager} \
      reward_model.format_mode=R1_nothink \
@@ -219,7 +227,15 @@
      algorithm.adv_estimator=${adv_estimator} \
      data.train_files="${TRAIN_FILE}" \
      data.val_files="${TEST_FILE}" \
-@@ -185,19 +186,21 @@
+@@ -130,6 +131,7 @@
+     actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=${infer_ppo_max_token_len} \
+     actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=${infer_ppo_max_token_len} \
+     actor_rollout_ref.rollout.name=vllm \
++    ++actor_rollout_ref.nccl_timeout=3600 \
+     actor_rollout_ref.model.path="${MODEL_PATH}" \
+     actor_rollout_ref.model.enable_gradient_checkpointing=True \
+     actor_rollout_ref.actor.optim.lr=1e-6 \
+@@ -185,19 +187,21 @@
      reward_model.off_policy_reward_manager=${off_policy_reward_manager} \
      reward_model.val_reward_manager=${val_reward_manager} \
      reward_model.format_mode=R1_nothink \
@@ -361,7 +377,15 @@
      algorithm.adv_estimator=${adv_estimator} \
      data.train_files="${TRAIN_FILE}" \
      data.val_files="${TEST_FILE}" \
-@@ -187,19 +188,21 @@
+@@ -132,6 +133,7 @@
+     actor_rollout_ref.ref.log_prob_max_token_len_per_gpu=${infer_ppo_max_token_len} \
+     actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=${infer_ppo_max_token_len} \
+     actor_rollout_ref.rollout.name=vllm \
++    ++actor_rollout_ref.nccl_timeout=3600 \
+     actor_rollout_ref.model.path="${MODEL_PATH}" \
+     actor_rollout_ref.model.enable_gradient_checkpointing=True \
+     actor_rollout_ref.actor.optim.lr=1e-6 \
+@@ -187,19 +189,21 @@
      reward_model.off_policy_reward_manager=${off_policy_reward_manager} \
      reward_model.val_reward_manager=${val_reward_manager} \
      reward_model.format_mode=R1_nothink \
